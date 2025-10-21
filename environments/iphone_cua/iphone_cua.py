@@ -5,20 +5,21 @@ from verifiers import Messages, State
 # in that case I should probably have a single sim objcet tied to the environment and then each state only has the simulator id attached
 
 # things to figure out
-'''
+"""
 1. does the env get recreated each time for every rollout or group of rollouts?
-'''
+"""
 
-'''
+"""
 FOR NOW KEEP SAME STARTING POINT FOR TASKS!!!!!! DO THIS FOR SIMPLICITY
-'''
+"""
 
-'''
+"""
 Sim pattern: create master sim -> each rollout, clone and on task completion, close the master sim
-'''
+"""
+
 
 class IPhoneCua(vf.MultiTurnEnv):
-    def __init__(self, max_turns: int = -1, **kwargs):
+    def __init__(self, max_turns: int = 15, **kwargs):
         super().__init__(max_turns, kwargs)
         self.sim = None
 
@@ -32,13 +33,7 @@ class IPhoneCua(vf.MultiTurnEnv):
 
         tool_use = last_msg["tool_use"]
         if tool_use is None:
-            sim_state.update(
-                {
-                    "terminated": True,
-                    "error": "No tool use.",
-                    "score": 0
-                }
-            )
+            sim_state.update({"terminated": True, "error": "No tool use.", "score": 0})
             return messages, state
         else:
             if tool_use == "FINISHED":
@@ -46,7 +41,7 @@ class IPhoneCua(vf.MultiTurnEnv):
                     {
                         "terminated": True,
                         "error": None,
-                        "score": judge(sim_state.last_obs)
+                        "score": judge(sim_state.last_obs),
                     }
                 )
                 return messages, state
@@ -60,13 +55,11 @@ class IPhoneCua(vf.MultiTurnEnv):
                         "terminated": error is not None,
                         "error": error,
                         "last_obs": obs,
-                        "score": 0
+                        "score": 0,
                     }
                 )
 
                 return messages + [obs], state if error is not None else messages, state
-
-
 
     async def is_completed(self, messages: Messages, state: State, **kwargs) -> bool:
         sim_state = state.get("sim_state", {})
@@ -79,7 +72,6 @@ class IPhoneCua(vf.MultiTurnEnv):
             self.sim.cleanup(sim_state["id"])
         return completed
 
-
     async def setup_state(self, state: State, **kwargs) -> State:
         sim_state = state.setdefault("sim", {})
         sim_state.update(
@@ -89,7 +81,7 @@ class IPhoneCua(vf.MultiTurnEnv):
                 "terminated": False,
                 "error": None,
                 "sim": None,
-                "score": 0
+                "score": 0,
             }
         )
 
@@ -103,7 +95,7 @@ class IPhoneCua(vf.MultiTurnEnv):
 
 
 def load_environment(**kwargs) -> vf.Environment:
-    '''
+    """
     Loads a custom environment.
-    '''
+    """
     raise NotImplementedError("Implement your custom environment here.")

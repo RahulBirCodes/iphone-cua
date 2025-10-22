@@ -218,6 +218,8 @@ class IPhoneSim:
     def reset(self):
         self._cleanup()
         self._new()
+        # allow the new sim to settle in window server + springboard
+        time.sleep(120)
 
     def close(self):
         print("\n --- Closing connections and sims ---")
@@ -231,7 +233,7 @@ if __name__ == "__main__":
     print("RESETTING CONTROLLER....")
     sim_controller.reset()
     print("finished reset, going to sleep")
-    time.sleep(120)
+    # time.sleep(120)
     geometry = sim_controller._get_window_geometry()
     if geometry:
         win_x, win_y, win_w, win_h = geometry

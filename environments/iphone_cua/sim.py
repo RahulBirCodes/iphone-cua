@@ -7,6 +7,8 @@ import textwrap
 import os
 import ssh_config
 import json
+from PIL import Image
+import io
 
 
 class InvalidArgException(Exception):
@@ -26,6 +28,7 @@ class IPhoneSim:
         self.main_id = None
         self.current_clone_id = None
         self.device_name = device_name
+        self.aspect_ratio = None
 
         print("Connecting to remote host...")
         self.ssh_client = paramiko.SSHClient()
@@ -35,7 +38,6 @@ class IPhoneSim:
         print("Connection successful.")
 
     def _run_command(self, command: str, timeout: int = 30) -> str:
-        print(f"Executing: {command}")
         try:
             # run gui control commands through remote agent
             if "osascript" in command:
@@ -48,6 +50,7 @@ class IPhoneSim:
                       -d '{json.dumps(data)}'"
                 )
                 print(f"executing command: {command} through remote agent")
+                print(f"original command: {og_cmd}")
                 curl_stdin, curl_stdout, curl_stderr = self.ssh_client.exec_command(command, timeout=timeout)
                 curl_exit_code = curl_stdout.channel.recv_exit_status()
                 curl_stdout_str = curl_stdout.read().decode("utf-8").strip()
@@ -62,6 +65,7 @@ class IPhoneSim:
                 stderr_str = data["stderr"]
                 command = og_cmd
             else:
+                print(f"executing: {command}")
                 stdin, stdout, stderr = self.ssh_client.exec_command(
                     command, timeout=timeout
                 )
@@ -77,6 +81,22 @@ class IPhoneSim:
             raise e
         except Exception as e:
             raise EnvException(f"error while executing command: {command}")
+
+    def _run_gui_command(self, command: str, timeout: int = 30, max_retries: int = 10) -> str:
+        """Utility function to run GUI commands with polling so account for WindowServer settling"""
+        attempt = 0
+        while True:
+            try:
+                self._run_command(command, timeout=timeout)
+                break
+            except EnvException as e:
+                print(f"  - Attempt {attempt + 1} failed: {e}. GUI not ready yet or permissions issue. Retrying...")
+                if attempt == max_retries - 1:
+                    print("  - FAILED: Max retries reached. Click command failed.")
+                    raise
+                time.sleep(1)
+            attempt += 1
+
 
     def _setup_main(self):
         print("\n--- Initializing main sim ---")
@@ -100,13 +120,23 @@ class IPhoneSim:
            """
         self._run_command(f"osascript -e '{bezel_script}'")
         self._run_command(f"xcrun simctl bootstatus {main_id} -b", timeout=300)
+        init_b64_obs = self._take_screenshot_b64(self.main_id)
+        obs_bytes = base64.b64decode(init_b64_obs.encode("utf-8"))
+        obs_file = io.BytesIO(obs_bytes)
+        with Image.open(obs_file) as img:
+            aspect_ratio = img.size[0] / img.size[1]
+            print("sim_window aspect ratio:", aspect_ratio)
+            self.aspect_ratio = aspect_ratio
         self._run_command(f"xcrun simctl shutdown {main_id}")
+        # let window server settle
+        # time.sleep(15)
         print("--- Main sim successfully initialized ---")
 
-    def _take_screenshot_b64(self) -> str:
+    def _take_screenshot_b64(self, sim_id = None) -> str:
         remote_path = f"/tmp/{uuid.uuid4()}.png"
+        sim_id = sim_id or self.current_clone_id
         self._run_command(
-            f"xcrun simctl io {self.current_clone_id} screenshot {remote_path}"
+            f"xcrun simctl io {sim_id} screenshot {remote_path}"
         )
         obs_b64 = ""
         try:
@@ -132,7 +162,7 @@ class IPhoneSim:
         if not new_clone_id:
             raise RuntimeError("Failed to create a new simulator clone.")
         self._run_command(f"xcrun simctl bootstatus {new_clone_id} -b", timeout=180)
-        time.sleep(15)  # allow sim ui to settle/load in
+        time.sleep(30)  # allow sim ui to settle/load in
         self.current_clone_id = new_clone_id
         print(f"--- New sim {self.current_clone_id} successfully cloned ---")
         return self._take_screenshot_b64()
@@ -196,50 +226,12 @@ class IPhoneSim:
         print("--- Closed connections ---")
 
 
-def print_base64_image(b64_string: str):
-    """
-    Prints a base64 encoded image to a compatible terminal.
-    Supports iTerm2 and the Kitty graphics protocol (used by Ghostty, WezTerm, etc.).
-    """
-    term = os.environ.get("TERM_PROGRAM", "").lower()
-
-    if "iterm.app" in term:
-        # iTerm2 image protocol
-        ESC = "\033"
-        print(
-            f"{ESC}]1337;File=inline=1;width=30%;preserveAspectRatio=1:{b64_string}{ESC}\\"
-        )
-
-    elif "ghostty" in term or "wezterm" in term:
-        # Kitty graphics protocol (chunked transfer)
-        # We write to stdout in chunks to avoid issues with large images.
-        encoded_payload = b64_string.encode("ascii")
-
-        # Start transmission
-        sys.stdout.buffer.write(b"\033_Gf=100,a=T,m=1;")
-
-        # Write payload in chunks
-        for chunk in textwrap.wrap(b64_string, 4096):
-            sys.stdout.buffer.write(chunk.encode("ascii"))
-            sys.stdout.buffer.write(b"\033\\")
-            sys.stdout.buffer.write(b"\033_Gm=1;")
-
-        # End transmission
-        sys.stdout.buffer.write(b"\033\\")
-        sys.stdout.flush()
-        print()  # Newline after image
-    else:
-        print(
-            f"[Image display not configured for terminal '{term}'. Showing first 100 chars of base64 string instead.]"
-        )
-        print(b64_string[:100] + "...")
-
-
 if __name__ == "__main__":
     sim_controller = IPhoneSim(ssh_config=ssh_config.SSH_CONFIG)
-    # print("RESETTING CONTROLLER....")
-    # sim_controller.reset()
-    print("DONE RESETTING CONTROLLER...")
+    print("RESETTING CONTROLLER....")
+    sim_controller.reset()
+    print("finished reset, going to sleep")
+    time.sleep(120)
     geometry = sim_controller._get_window_geometry()
     if geometry:
         win_x, win_y, win_w, win_h = geometry
@@ -249,9 +241,35 @@ if __name__ == "__main__":
         center_y = win_y + (win_h / 2)
 
         print(f"Calculated window center at: ({int(center_x)}, {int(center_y)})")
+        print(f"Current aspect ratio of the simulator window: {sim_controller.aspect_ratio}")
 
-        click_center_command = f"osascript -e 'tell application \"Simulator\" to activate' -e 'tell application \"System Events\" to click at {{{int(center_x)}, {int(center_y)}}}'"
-        sim_controller._run_command(click_center_command)
+        click_center_command = f"osascript -e 'tell application \"Simulator\" to activate' -e 'tell application \"System Events\" to click at {{{int(center_x) - 10}, {int(center_y) - 10}}}'"
+        # # click_center_command = f"osascript -e 'tell application \"Simulator\" to activate' -e 'tell application \"System Events\" to click at {{{214}, {700}}}'"
+        # sim_controller._run_command(click_center_command)
+        sim_controller._run_gui_command(click_center_command)
+        # attempt = 0
+        # max_retries = 20
+        # while True:
+        #     try:
+        #         print(f"  - Attempt {attempt + 1} to execute click command...")
+        #         sim_controller._run_command(click_center_command)  # Attempt the click
+        #         print("  - SUCCESS: Click command executed without error.")
+        #         click_successful = True
+        #         break  # Exit the loop if successful
+        #     except EnvException as e:
+        #         # Catch the specific error from _run_command (includes -25204)
+        #         print(f"  - Attempt {attempt + 1} failed: {e}. GUI not ready yet or permissions issue. Retrying...")
+        #         if attempt == max_retries - 1:
+        #             print("  - FAILED: Max retries reached. Click command failed.")
+        #             raise  # Re-raise the last exception if all retries fail
+        #         time.sleep(1)  # Wait before the next attempt
+
+
+
+
+
+
+
     #
     #     print(
     #         "\nSUCCESS: A 'click' command was sent to the calculated center of the simulator window."

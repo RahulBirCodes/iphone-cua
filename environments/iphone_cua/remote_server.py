@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import subprocess
 import logging
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -19,7 +20,8 @@ def run_command():
     if not data or "command" not in data:
         logging.warning("Missing 'command' in request JSON")
         return jsonify({"error": "Missing 'command' in JSON"}), 400
-    command = data["command"]
+    enc_cmd = data["command"].encode("utf-8")
+    command = base64.b64decode(enc_cmd).decode("utf-8")
     logging.info(f"Received command: {command}")
     try:
         # Execute the command

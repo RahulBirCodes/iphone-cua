@@ -6,6 +6,7 @@ import sys
 import textwrap
 import os
 import ssh_config
+import json
 
 
 class InvalidArgException(Exception):
@@ -38,14 +39,35 @@ class IPhoneSim:
         try:
             # run gui control commands through remote agent
             if "osascript" in command:
-                command = f"curl -s -X POST http://127.0.0.1:9000/run -d command={command.replace("'", "\\'")}"
+                og_cmd = command
+                enc_cmd = base64.b64encode(command.encode("utf-8")).decode("utf-8")
+                data = {"command": enc_cmd}
+                command = (
+                    f"curl -s -X POST http://127.0.0.1:9000/run \
+                      -H \"Content-Type: application/json\" \
+                      -d '{json.dumps(data)}'"
+                )
                 print(f"executing command: {command} through remote agent")
-            stdin, stdout, stderr = self.ssh_client.exec_command(
-                command, timeout=timeout
-            )
-            exit_code = stdout.channel.recv_exit_status()
-            stdout_str = stdout.read().decode("utf-8").strip()
-            stderr_str = stderr.read().decode("utf-8").strip()
+                curl_stdin, curl_stdout, curl_stderr = self.ssh_client.exec_command(command, timeout=timeout)
+                curl_exit_code = curl_stdout.channel.recv_exit_status()
+                curl_stdout_str = curl_stdout.read().decode("utf-8").strip()
+                curl_stderr_str = curl_stderr.read().decode("utf-8").strip()
+                if curl_exit_code != 0:
+                    err_msg = f"curl command to remote agent failed with exit code {curl_exit_code}. stderr: {curl_stderr_str} stdout: {curl_stdout_str}"
+                    print(err_msg)
+                    raise EnvException(err_msg)
+                data = json.loads(curl_stdout_str)
+                exit_code = data["returncode"]
+                stdout_str = data["stdout"]
+                stderr_str = data["stderr"]
+                command = og_cmd
+            else:
+                stdin, stdout, stderr = self.ssh_client.exec_command(
+                    command, timeout=timeout
+                )
+                exit_code = stdout.channel.recv_exit_status()
+                stdout_str = stdout.read().decode("utf-8").strip()
+                stderr_str = stderr.read().decode("utf-8").strip()
             if exit_code != 0:
                 err_msg = f"command: {command} failed with exit code: {exit_code}. stderr: {stderr_str} stdout: {stdout_str}"
                 print(err_msg)
@@ -116,7 +138,7 @@ class IPhoneSim:
         return self._take_screenshot_b64()
 
     def _get_window_geometry(self) -> tuple[int, int, int, int]:
-        """Uses AppleScript to get the position and size of the Simulator window."""
+        """Uses AppleScript to get the position and size of the Simulator window. Includes height of menu bar."""
         script = """
         tell application "System Events" to tell process "Simulator"
             set frontmost to true
@@ -128,6 +150,7 @@ class IPhoneSim:
         """
         result = self._run_command(f"osascript -e '{script}'")
         if not result or "error" in result:
+            print("ERROR:", result)
             raise EnvironmentError("Could not get simulator window geometry.")
         try:
             return tuple(map(int, result.split(",")))
@@ -214,14 +237,9 @@ def print_base64_image(b64_string: str):
 
 if __name__ == "__main__":
     sim_controller = IPhoneSim(ssh_config=ssh_config.SSH_CONFIG)
-    print("RESETTING CONTROLLER....")
-    sim_controller.reset()
+    # print("RESETTING CONTROLLER....")
+    # sim_controller.reset()
     print("DONE RESETTING CONTROLLER...")
-    print("TAKING SCREENSHOT OF SIM STATE...")
-    obs = sim_controller._take_screenshot_b64()
-    print("SUCCESSFULLY TOOK SCREENSHOT AND PRINTING...")
-    print_base64_image(obs)
-    print("GETTING WINDOW DIMENSION AND DRAGGING MOUSE...")
     geometry = sim_controller._get_window_geometry()
     if geometry:
         win_x, win_y, win_w, win_h = geometry
@@ -232,22 +250,19 @@ if __name__ == "__main__":
 
         print(f"Calculated window center at: ({int(center_x)}, {int(center_y)})")
 
-        # Construct the CORRECT osascript command using 'click at'
-        click_center_command = f"osascript -e 'tell application \"System Events\" to click at {{{500}, {500}}}'"
-
-        # Execute the command
+        click_center_command = f"osascript -e 'tell application \"Simulator\" to activate' -e 'tell application \"System Events\" to click at {{{int(center_x)}, {int(center_y)}}}'"
         sim_controller._run_command(click_center_command)
-
-        print(
-            "\nSUCCESS: A 'click' command was sent to the calculated center of the simulator window."
-        )
-        print(
-            "Please check your VM's screen to visually validate the mouse position and click effect."
-        )
-        print("Pausing for 10 seconds before cleanup...")
-        time.sleep(10)
-    else:
-        print("Could not get window geometry, skipping validation.")
+    #
+    #     print(
+    #         "\nSUCCESS: A 'click' command was sent to the calculated center of the simulator window."
+    #     )
+    #     print(
+    #         "Please check your VM's screen to visually validate the mouse position and click effect."
+    #     )
+    #     print("Pausing for 10 seconds before cleanup...")
+    #     time.sleep(10)
+    # else:
+    #     print("Could not get window geometry, skipping validation.")
 
     #
     #

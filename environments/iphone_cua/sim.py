@@ -2,9 +2,6 @@ import base64
 import paramiko
 import time
 import uuid
-import sys
-import textwrap
-import os
 import ssh_config
 import json
 from PIL import Image
@@ -128,8 +125,6 @@ class IPhoneSim:
             print("sim_window aspect ratio:", aspect_ratio)
             self.aspect_ratio = aspect_ratio
         self._run_command(f"xcrun simctl shutdown {main_id}")
-        # let window server settle
-        # time.sleep(15)
         print("--- Main sim successfully initialized ---")
 
     def _take_screenshot_b64(self, sim_id = None) -> str:
@@ -162,13 +157,12 @@ class IPhoneSim:
         if not new_clone_id:
             raise RuntimeError("Failed to create a new simulator clone.")
         self._run_command(f"xcrun simctl bootstatus {new_clone_id} -b", timeout=180)
-        time.sleep(30)  # allow sim ui to settle/load in
         self.current_clone_id = new_clone_id
         print(f"--- New sim {self.current_clone_id} successfully cloned ---")
         return self._take_screenshot_b64()
 
     def _get_window_geometry(self) -> tuple[int, int, int, int]:
-        """Uses AppleScript to get the position and size of the Simulator window. Includes height of menu bar."""
+        """Gets the position and size of the Simulator window. Includes height of menu bar."""
         script = """
         tell application "System Events" to tell process "Simulator"
             set frontmost to true
@@ -192,19 +186,36 @@ class IPhoneSim:
             raise InvalidArgException(
                 f"Normalized coordinates ({norm_x}, {norm_y}) are out of the [0.0, 1.0] bounds."
             )
-        # ... (rest of the logic is the same)
-        geometry = self._get_window_geometry()
-        win_x, win_y, win_w, win_h = geometry
-        scale = win_w / self.screen_width
-        expected_content_h = self.screen_height * scale
+        win_x, win_y, win_w, win_h = self._get_window_geometry()
+        expected_content_h = win_w / self.aspect_ratio
         title_bar_h = win_h - expected_content_h
         content_origin_x = win_x
-        content_origin_y = win_y + title_bar_h
+        content_origin_y = win_y + title_bar_h # Offset by the calculated title bar height
         abs_x = content_origin_x + (norm_x * win_w)
         abs_y = content_origin_y + (norm_y * expected_content_h)
-        abs_x = max(win_x, min(abs_x, win_x + win_w - 1))
-        abs_y = max(win_y, min(abs_y, win_y + win_h - 1))
         return int(abs_x), int(abs_y)
+
+    def _handle_tap(self, action: dict):
+        coords = self._translate_coords(action['x'], action['y'])
+        command = f"osascript -e 'tell application \"System Events\" to click at {{{coords[0]}, {coords[1]}}}'"
+        self._run_gui_command(command)
+
+    def _handle_swipe(self, action: dict):
+        start_coords = self._translate_coords(action['start_x'], action['start_y'])
+        end_coords = self._translate_coords(action['end_x'], action['end_y'])
+        command = f"osascript -e 'tell application \"System Events\" to tell process \"Simulator\" to click and drag from {{{start_coords[0]}, {start_coords[1]}}} to {{{end_coords[0]}, {end_coords[1]}}} with duration 0.5'"
+        self._run_gui_command(command)
+
+    def _handle_type_text(self, action: dict):
+        text = action['text'].replace("'", "\\'").replace('"', '\\"')
+        command = f"osascript -e 'tell application \"System Events\" to keystroke \"{text}\"'"
+        self._run_gui_command(command)
+
+    def _handle_go_home(self, action: dict):
+        command = "osascript -e 'tell application \"System Events\" to key code 102 using {shift down, command down}'"
+        self._run_gui_command(command)
+
+
 
     def _cleanup(self):
         if not self.current_clone_id:
@@ -219,7 +230,8 @@ class IPhoneSim:
         self._cleanup()
         self._new()
         # allow the new sim to settle in window server + springboard
-        time.sleep(120)
+        print("sleeping to allow springboard to settle")
+        time.sleep(70)
 
     def close(self):
         print("\n --- Closing connections and sims ---")
@@ -230,110 +242,7 @@ class IPhoneSim:
 
 if __name__ == "__main__":
     sim_controller = IPhoneSim(ssh_config=ssh_config.SSH_CONFIG)
-    print("RESETTING CONTROLLER....")
     sim_controller.reset()
-    print("finished reset, going to sleep")
-    # time.sleep(120)
-    geometry = sim_controller._get_window_geometry()
-    if geometry:
-        win_x, win_y, win_w, win_h = geometry
 
-        # Calculate the absolute center of the window
-        center_x = win_x + (win_w / 2)
-        center_y = win_y + (win_h / 2)
-
-        print(f"Calculated window center at: ({int(center_x)}, {int(center_y)})")
-        print(f"Current aspect ratio of the simulator window: {sim_controller.aspect_ratio}")
-
-        click_center_command = f"osascript -e 'tell application \"Simulator\" to activate' -e 'tell application \"System Events\" to click at {{{int(center_x) - 10}, {int(center_y) - 10}}}'"
-        # # click_center_command = f"osascript -e 'tell application \"Simulator\" to activate' -e 'tell application \"System Events\" to click at {{{214}, {700}}}'"
-        # sim_controller._run_command(click_center_command)
-        sim_controller._run_gui_command(click_center_command)
-        # attempt = 0
-        # max_retries = 20
-        # while True:
-        #     try:
-        #         print(f"  - Attempt {attempt + 1} to execute click command...")
-        #         sim_controller._run_command(click_center_command)  # Attempt the click
-        #         print("  - SUCCESS: Click command executed without error.")
-        #         click_successful = True
-        #         break  # Exit the loop if successful
-        #     except EnvException as e:
-        #         # Catch the specific error from _run_command (includes -25204)
-        #         print(f"  - Attempt {attempt + 1} failed: {e}. GUI not ready yet or permissions issue. Retrying...")
-        #         if attempt == max_retries - 1:
-        #             print("  - FAILED: Max retries reached. Click command failed.")
-        #             raise  # Re-raise the last exception if all retries fail
-        #         time.sleep(1)  # Wait before the next attempt
-
-
-
-
-
-
-
-    #
-    #     print(
-    #         "\nSUCCESS: A 'click' command was sent to the calculated center of the simulator window."
-    #     )
-    #     print(
-    #         "Please check your VM's screen to visually validate the mouse position and click effect."
-    #     )
-    #     print("Pausing for 10 seconds before cleanup...")
-    #     time.sleep(10)
-    # else:
-    #     print("Could not get window geometry, skipping validation.")
-
-    #
-    #
-    # print("\n--- Fully Automated Golden Master Setup ---")
-    # print("OPENING SIMULATOR...")
-    # sim_controller._run_command("open -a Simulator")
-    # time.sleep(5)
-    #
-    # print("SHUT DOWN AND DELETE ALL OPEN SIMULATORS...")
-    # sim_controller._run_command("xcrun simctl shutdown all")
-    # sim_controller._run_command("xcrun simctl delete all")
-    # master_id = sim_controller._run_command(
-    #     f"xcrun simctl create '{sim_controller.main_sim_name}' com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro").strip()
-    # if not master_id: raise RuntimeError("Failed to create master simulator.")
-    # print("got master id: {}".format(master_id))
-    #
-    # bezel_script = """
-    # tell application "System Events" to tell process "Simulator"
-    #     set frontmost to true
-    #     if (value of attribute "AXMenuItemMarkChar" of menu item "Show Device Bezels" of menu "Window" of menu bar 1) is "✓" then
-    #         click menu item "Show Device Bezels" of menu "Window" of menu bar 1
-    #     end if
-    # end tell
-    # """
-    # print("RUNNING SCRIPT TO DISABLE SIMULATOR BEZELS...")
-    # sim_controller._run_command(f"osascript -e '{bezel_script}'")
-    #
-    # print("WAIT FOR SIMULATOR TO FINISH BOOTING...")
-    # sim_controller._run_command(f"xcrun simctl bootstatus {master_id} -b", timeout=300)
-    # print("SHUTTING DOWN SIMULATOR...")
-    # sim_controller._run_command(f"xcrun simctl shutdown {master_id}")
-    # print("--- Golden Master setup complete. ---")
-    #
-    #
-    #
-    #
-    # print("SETTING UP NEW SIMULATOR...")
-    # if sim_controller.current_clone_id is not None:
-    #     raise RuntimeError(
-    #         f"A simulator clone ({sim_controller.current_clone_id}) is already running. Please call cleanup() before starting a new one.")
-    #
-    # print("ENSURING SIMULATOR IS OPEN...")
-    # sim_controller._run_command("open -a Simulator")
-    #
-    # print(f"CREATING NEW CLONE...")
-    # new_clone_id = sim_controller._run_command(f"xcrun simctl clone '{sim_controller.main_sim_name}' 'current_sim'").strip()
-    # if not new_clone_id: raise RuntimeError("Failed to create a new simulator clone.")
-    #
-    # print(f"BOOTING UP NEW CLONE...")
-    # sim_controller._run_command(f"xcrun simctl bootstatus {new_clone_id} -b", timeout=180)
-    #
-    # sim_controller.current_clone_id = new_clone_id
-    #
-    # print(f"Boot complete. Active simulator is now {sim_controller.current_clone_id}")
+    # test internal handlers
+    sim_controller._handle_tap({"x": 0.4, "y": 0.5})

@@ -6,6 +6,7 @@ import ssh_config
 import json
 from PIL import Image
 import io
+import shlex
 
 
 class InvalidArgException(Exception):
@@ -196,23 +197,47 @@ class IPhoneSim:
         return int(abs_x), int(abs_y)
 
     def _handle_tap(self, action: dict):
+        # coords = self._translate_coords(action['x'], action['y'])
+        # command = f"osascript -e 'tell application \"System Events\" to click at {{{coords[0]}, {coords[1]}}}'"
+        # self._run_gui_command(command)
+
         coords = self._translate_coords(action['x'], action['y'])
-        command = f"osascript -e 'tell application \"System Events\" to click at {{{coords[0]}, {coords[1]}}}'"
+        command = f"cliclick c:{coords[0]},{coords[1]}"
         self._run_gui_command(command)
 
     def _handle_swipe(self, action: dict):
+        # start_coords = self._translate_coords(action['start_x'], action['start_y'])
+        # end_coords = self._translate_coords(action['end_x'], action['end_y'])
+        # command = f"osascript -e 'tell application \"System Events\" to tell process \"Simulator\" to click and drag from {{{start_coords[0]}, {start_coords[1]}}} to {{{end_coords[0]}, {end_coords[1]}}} with duration 0.5'"
+        # self._run_gui_command(command)
+
         start_coords = self._translate_coords(action['start_x'], action['start_y'])
         end_coords = self._translate_coords(action['end_x'], action['end_y'])
-        command = f"osascript -e 'tell application \"System Events\" to tell process \"Simulator\" to click and drag from {{{start_coords[0]}, {start_coords[1]}}} to {{{end_coords[0]}, {end_coords[1]}}} with duration 0.5'"
+        command_parts = [
+            f"m:{start_coords[0]},{start_coords[1]}",
+            f"dd:{start_coords[0]},{start_coords[1]}",
+            "w:50",
+            f"m:{end_coords[0]},{end_coords[1]}",
+            "w:50",
+            f"du:{end_coords[0]},{end_coords[1]}",
+        ]
+        command = f"cliclick {' '.join(command_parts)}"
         self._run_gui_command(command)
 
     def _handle_type_text(self, action: dict):
-        text = action['text'].replace("'", "\\'").replace('"', '\\"')
-        command = f"osascript -e 'tell application \"System Events\" to keystroke \"{text}\"'"
+        # text = action['text'].replace("'", "\\'").replace('"', '\\"')
+        # command = f"osascript -e 'tell application \"System Events\" to keystroke \"{text}\"'"
+        # self._run_gui_command(command)
+
+        text_arg = shlex.quote(f"t:{action['text']}")
+        command = f"cliclick {text_arg}"
         self._run_gui_command(command)
 
     def _handle_go_home(self, action: dict):
-        command = "osascript -e 'tell application \"System Events\" to key code 102 using {shift down, command down}'"
+        # command = "osascript -e 'tell application \"System Events\" to key code 102 using {shift down, command down}'"
+        # self._run_gui_command(command)
+
+        command = "cliclick kp:cmd+shift+h"
         self._run_gui_command(command)
 
 
@@ -245,4 +270,16 @@ if __name__ == "__main__":
     sim_controller.reset()
 
     # test internal handlers
-    sim_controller._handle_tap({"x": 0.4, "y": 0.5})
+    # sim_controller._handle_tap({"x": 0.4, "y": 0.5})
+    # sim_controller._handle_swipe({"start_x": 0.8, "start_y": 0.5, "end_x": 0.2, "end_y": 0.5})
+
+    start_coords = sim_controller._translate_coords(0.8, 0.5)
+    end_coords = sim_controller._translate_coords(0.2, 0.5)
+    command = f"""osascript -e 'tell application "System Events" to tell process "Simulator"
+        click down at {{{start_coords[0]}, {start_coords[1]}}}
+        delay 0.1
+        move mouse to {{{end_coords[0]}, {end_coords[1]}}}
+        delay 0.1
+        click up at {{{end_coords[0]}, {end_coords[1]}}}
+    end tell'"""
+    sim_controller._run_command(command)

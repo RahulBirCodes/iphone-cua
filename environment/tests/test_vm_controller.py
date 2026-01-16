@@ -9,7 +9,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -53,6 +53,59 @@ def _write_runner(tmp_dir: Path) -> Path:
         encoding="utf-8",
     )
     return runner
+
+
+def _resolve_remote_python(ssh_base: list[str], fallback: str) -> str:
+    result = _run(ssh_base + ["which", fallback], check=False)
+    path = result.stdout.strip()
+    return path if path else fallback
+
+
+def _write_plist(tmp_dir: Path, label: str, python_path: str, script_path: str, port: int) -> Path:
+    plist = tmp_dir / f"{label}.plist"
+    plist.write_text(
+        f"""<?xml version="1.0" encoding="UTF-8"?>\n"""
+        """<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n"""
+        """ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n"""
+        """<plist version="1.0">\n"""
+        """<dict>\n"""
+        f"  <key>Label</key> <string>{label}</string>\n"
+        "  <key>ProgramArguments</key>\n"
+        "  <array>\n"
+        f"    <string>{python_path}</string>\n"
+        f"    <string>{script_path}</string>\n"
+        f"    <string>--port</string>\n"
+        f"    <string>{port}</string>\n"
+        "  </array>\n"
+        "  <key>RunAtLoad</key> <true/>\n"
+        "  <key>KeepAlive</key> <true/>\n"
+        "  <key>StandardOutPath</key> <string>/tmp/vm_controller.out</string>\n"
+        "  <key>StandardErrorPath</key> <string>/tmp/vm_controller.err</string>\n"
+        "</dict>\n"
+        "</plist>\n",
+        encoding="utf-8",
+    )
+    return plist
+
+
+def _install_launch_agent(
+    args: argparse.Namespace,
+    ssh_base: list[str],
+    scp_base: list[str],
+    label: str,
+    remote_dir: str,
+) -> Tuple[str, str]:
+    python_path = _resolve_remote_python(ssh_base, args.python)
+    plist_remote_path = f"/Users/{args.user}/Library/LaunchAgents/{label}.plist"
+    script_remote_path = f"{remote_dir}/run_vm_controller.py"
+    _run(ssh_base + [f"mkdir -p /Users/{args.user}/Library/LaunchAgents"])
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        plist = _write_plist(tmp_dir, label, python_path, script_remote_path, args.remote_port)
+        _run(scp_base + [str(plist), f"{args.user}@{args.host}:{plist_remote_path}"])
+    _run(ssh_base + [f"launchctl unload {plist_remote_path} >/dev/null 2>&1 || true"])
+    _run(ssh_base + [f"launchctl load {plist_remote_path}"])
+    return plist_remote_path, python_path
 
 
 def _post_action(url: str, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -114,17 +167,8 @@ def main() -> int:
             ]
         )
 
-    start_cmd = (
-        f"cd {remote_dir} && nohup {args.python} run_vm_controller.py "
-        f"--port {args.remote_port} > vm_controller.log 2>&1 & echo $!"
-    )
-    result = _run(ssh_base + [start_cmd])
-    pid = result.stdout.strip()
-    if not pid.isdigit():
-        print("Failed to start remote vm_controller. Output:")
-        print(result.stdout)
-        print(result.stderr)
-        return 1
+    label = "com.iphonecua.vmcontroller"
+    plist_remote_path, _ = _install_launch_agent(args, ssh_base, scp_base, label, remote_dir)
 
     tunnel_cmd = ssh_base[:-1] + [
         "-N",
@@ -145,39 +189,49 @@ def main() -> int:
         _post_action(url, "reset", {})
         _prompt("Press Enter to continue to tap...", args.auto)
 
-        print("Tap at center (0.5, 0.5)")
-        print(_post_action(url, "tap", {"x": 0.5, "y": 0.5}))
-        _prompt("Press Enter to continue to swipe...", args.auto)
-
-        print("Swipe left-to-right")
-        print(
-            _post_action(
-                url,
-                "swipe",
-                {"x1": 0.2, "y1": 0.5, "x2": 0.8, "y2": 0.5},
-            )
-        )
-        _prompt("Press Enter to continue to type...", args.auto)
-
-        print("Type text")
-        print(_post_action(url, "type_text", {"text": "hello from vm_controller"}))
-        _prompt("Press Enter to continue to go_home...", args.auto)
-
-        print("Go home")
-        print(_post_action(url, "go_home", {}))
-        _prompt("Press Enter to continue to wait...", args.auto)
-
-        print("Wait")
-        print(_post_action(url, "wait", {"seconds": 1.0}))
-        _prompt("Press Enter to observe...", args.auto)
-
-        print("Observe")
-        print(_post_action(url, "observe", {}))
+        print("Tap at (0.4, 0.4)")
+        result = _post_action(url, "tap", {"x": 0.4, "y": 0.4})
+        if result.get("error"):
+            print(f"Error: {result['error']}")
         _prompt("Press Enter to finish...", args.auto)
+
+        # print("Swipe left-to-right")
+        # result = _post_action(
+        #     url,
+        #     "swipe",
+        #     {"x1": 0.2, "y1": 0.5, "x2": 0.8, "y2": 0.5},
+        # )
+        # if result.get("error"):
+        #     print(f"Error: {result['error']}")
+        # _prompt("Press Enter to continue to type...", args.auto)
+
+        # print("Type text")
+        # result = _post_action(url, "type_text", {"text": "hello from vm_controller"})
+        # if result.get("error"):
+        #     print(f"Error: {result['error']}")
+        # _prompt("Press Enter to continue to go_home...", args.auto)
+
+        # print("Go home")
+        # result = _post_action(url, "go_home", {})
+        # if result.get("error"):
+        #     print(f"Error: {result['error']}")
+        # _prompt("Press Enter to continue to wait...", args.auto)
+
+        # print("Wait")
+        # result = _post_action(url, "wait", {"seconds": 1.0})
+        # if result.get("error"):
+        #     print(f"Error: {result['error']}")
+        # _prompt("Press Enter to observe...", args.auto)
+
+        # print("Observe")
+        # result = _post_action(url, "observe", {})
+        # if result.get("error"):
+        #     print(f"Error: {result['error']}")
+        # _prompt("Press Enter to finish...", args.auto)
     finally:
         tunnel.terminate()
         tunnel.wait(timeout=10)
-        _run(ssh_base + [f"kill {pid}"])
+        _run(ssh_base + [f"launchctl unload {plist_remote_path} >/dev/null 2>&1 || true"])
 
     return 0
 

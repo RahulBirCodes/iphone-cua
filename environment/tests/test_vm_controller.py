@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import base64
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -127,6 +128,17 @@ def _prompt(msg: str, auto: bool) -> None:
     input(msg)
 
 
+def save_b64_image(b64_str: str, out_path: str) -> None:
+    out_path = os.path.expanduser(out_path)
+
+    if b64_str.startswith("data:"):
+        b64_str = b64_str.split(",", 1)[1]
+
+    img_bytes = base64.b64decode(b64_str)
+    with open(out_path, "wb") as f:
+        f.write(img_bytes)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="SSH into a VM, install vm_controller, and run manual action tests."
@@ -199,41 +211,44 @@ def main() -> int:
         result = _post_action(url, "tap", {"x": 0.5, "y": 0.5})
         if result.get("error"):
             print(f"Error: {result['error']}")
+        _prompt("Press Enter to continue to swipe...", args.auto)
+
+        print("Swipe left-to-right")
+        result = _post_action(
+            url,
+            "swipe",
+            {"x1": 0.3, "y1": 0.5, "x2": 0.8, "y2": 0.5},
+        )
+        if result.get("error"):
+            print(f"Error: {result['error']}")
+        _prompt("Press Enter to continue to type...", args.auto)
+
+        print("Type text")
+        result = _post_action(url, "type_text", {"text": "hello from vm_controller"})
+        if result.get("error"):
+            print(f"Error: {result['error']}")
+        _prompt("Press Enter to continue to go_home...", args.auto)
+
+        save_b64_image(result["screenshot_b64"], "~/Desktop/debug_image.jpg")
+
+        print("Go home")
+        result = _post_action(url, "go_home", {})
+        if result.get("error"):
+            print(f"Error: {result['error']}")
+        _prompt("Press Enter to continue to wait...", args.auto)
+
+        print("Wait")
+        result = _post_action(url, "wait", {"seconds": 1.0})
+        if result.get("error"):
+            print(f"Error: {result['error']}")
+        _prompt("Press Enter to observe...", args.auto)
+
+        print("Observe")
+        result = _post_action(url, "observe", {})
+        if result.get("error"):
+            print(f"Error: {result['error']}")
         _prompt("Press Enter to finish...", args.auto)
 
-        # print("Swipe left-to-right")
-        # result = _post_action(
-        #     url,
-        #     "swipe",
-        #     {"x1": 0.2, "y1": 0.5, "x2": 0.8, "y2": 0.5},
-        # )
-        # if result.get("error"):
-        #     print(f"Error: {result['error']}")
-        # _prompt("Press Enter to continue to type...", args.auto)
-
-        # print("Type text")
-        # result = _post_action(url, "type_text", {"text": "hello from vm_controller"})
-        # if result.get("error"):
-        #     print(f"Error: {result['error']}")
-        # _prompt("Press Enter to continue to go_home...", args.auto)
-
-        # print("Go home")
-        # result = _post_action(url, "go_home", {})
-        # if result.get("error"):
-        #     print(f"Error: {result['error']}")
-        # _prompt("Press Enter to continue to wait...", args.auto)
-
-        # print("Wait")
-        # result = _post_action(url, "wait", {"seconds": 1.0})
-        # if result.get("error"):
-        #     print(f"Error: {result['error']}")
-        # _prompt("Press Enter to observe...", args.auto)
-
-        # print("Observe")
-        # result = _post_action(url, "observe", {})
-        # if result.get("error"):
-        #     print(f"Error: {result['error']}")
-        # _prompt("Press Enter to finish...", args.auto)
     finally:
         tunnel.terminate()
         tunnel.wait(timeout=10)

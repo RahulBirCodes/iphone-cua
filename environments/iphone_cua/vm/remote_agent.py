@@ -3,21 +3,13 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Tuple
-
 from flask import Flask, jsonify, request
 from pynput.keyboard import Controller as KeyboardController, Key
 from pynput.mouse import Button, Controller as MouseController
+from environments.types import InvalidArgException, EnvException
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-
-class InvalidArgException(Exception):
-    """Raised for invalid arguments supplied to the simulator controller."""
-
-
-class EnvException(Exception):
-    """Raised when the simulator environment fails to respond as expected."""
 
 
 class SimController:
@@ -29,10 +21,7 @@ class SimController:
             aspect_ratio_str = aspect_ratio_path.read_text(encoding="utf-8").strip()
         except FileNotFoundError as exc:
             raise EnvException(f"aspect_ratio file not found at {aspect_ratio_path}") from exc
-        try:
-            self.aspect_ratio = float(aspect_ratio_str)
-        except ValueError as exc:
-            raise EnvException(f"Invalid aspect_ratio value: {aspect_ratio_str}") from exc
+        self.aspect_ratio = float(aspect_ratio_str)
 
     def _run_command(self, command: str, timeout: int = 30) -> str:
         try:
@@ -161,12 +150,12 @@ def execute_command() -> tuple[dict, int]:
         sim_controller.step(payload)
     except InvalidArgException as exc:
         logging.warning("Invalid action payload: %s", exc)
-        return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": "InvalidArgException"}), 400
     except EnvException as exc:
         logging.error("Environment failure while executing action: %s", exc)
-        return jsonify({"error": str(exc)}), 500
-    except Exception:
-        logging.exception("Unexpected error while executing command.")
+        return jsonify({"error": "EnvException"}), 500
+    except Exception as exc:
+        logging.exception("Unexpected error while executing command: %s", exc)
         return jsonify({"error": "Internal server error"}), 500
 
     return jsonify({"status": "OK"}), 200

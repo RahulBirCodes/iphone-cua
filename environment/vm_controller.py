@@ -22,6 +22,7 @@ class VMController:
         - go_home: {}
         - wait: {seconds}
         - reset: {}
+        - set_device: {device_name}
         - observe: {}
 
     Request format (POST /action):
@@ -31,16 +32,12 @@ class VMController:
         {"screenshot_b64": "<base64>", "error": "<message or null>"}
     """
 
-    def __init__(
-        self,
-        host: str = "0.0.0.0",
-        port: int = 8000,
-        aspect_ratio_path: Optional[Path] = None,
-    ) -> None:
+    def __init__(self, host: str = "0.0.0.0", port: int = 8000) -> None:
         self.host = host
         self.port = port
-        self._aspect_ratio_path = aspect_ratio_path or Path("aspect_ratio.txt")
-        self._aspect_ratio: Optional[float] = None
+        self._device_name = "iPhone-17-Pro"
+        self._device_udids: Dict[str, str] = {}
+        self._device_aspect_ratios: Dict[str, float] = {}
         self._handlers: Dict[str, Callable[[Dict[str, Any]], None]] = {
             "tap": self._handle_tap,
             "swipe": self._handle_swipe,
@@ -48,6 +45,7 @@ class VMController:
             "go_home": self._handle_go_home,
             "wait": self._handle_wait,
             "reset": self._handle_reset,
+            "set_device": self._handle_set_device,
             "observe": self._handle_observe,
         }
 
@@ -70,7 +68,10 @@ class VMController:
         abs_x, abs_y = self._normalized_to_screen(x, y)
         controller = mouse.Controller()
         controller.position = (abs_x, abs_y)
-        controller.click(mouse.Button.left, 1)
+        time.sleep(0.02)
+        controller.press(mouse.Button.left)
+        time.sleep(0.02)
+        controller.release(mouse.Button.left)
 
     def _handle_swipe(self, params: Dict[str, Any]) -> None:
         x1 = float(params.get("x1", 0.0))
@@ -106,18 +107,18 @@ class VMController:
 
     def _handle_reset(self, params: Dict[str, Any]) -> None:
         _ = params
-        _run_command(["open", "-a", "Simulator"])
-        bezel_script = (
-            'tell application "System Events" to tell process "Simulator"\n'
-            "    set frontmost to true\n"
-            '    if (value of attribute "AXMenuItemMarkChar" of menu item '
-            '"Show Device Bezels" of menu "Window" of menu bar 1) is "✓" then\n'
-            '        click menu item "Show Device Bezels" of menu "Window" of menu bar 1\n'
-            "    end if\n"
-            "end tell"
-        )
-        _run_command(["osascript", "-e", bezel_script])
-        _run_command(["xcrun", "simctl", "erase", "all"], timeout=300)
+        udid = self._get_or_create_device_udid()
+        _run_command_allow_fail(["xcrun", "simctl", "shutdown", udid])
+        _run_command(["xcrun", "simctl", "erase", udid], timeout=300)
+        _run_command(["xcrun", "simctl", "boot", udid], timeout=300)
+        _run_command(["xcrun", "simctl", "bootstatus", udid, "-b"], timeout=300)
+        # Bezels are handled in the base VM image.
+
+    def _handle_set_device(self, params: Dict[str, Any]) -> None:
+        device_name = str(params.get("device_name", "")).strip()
+        if not device_name:
+            return
+        self._device_name = device_name
 
     def _handle_observe(self, params: Dict[str, Any]) -> None:
         _ = params
@@ -154,19 +155,36 @@ class VMController:
         return int(abs_x), int(abs_y)
 
     def _get_aspect_ratio(self) -> float:
-        if self._aspect_ratio is not None:
-            return self._aspect_ratio
-        if self._aspect_ratio_path.exists():
-            value = self._aspect_ratio_path.read_text(encoding="utf-8").strip()
-            self._aspect_ratio = float(value)
-            return self._aspect_ratio
+        cached = self._device_aspect_ratios.get(self._device_name)
+        if cached is not None:
+            return cached
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sim.png"
             _capture_simulator_png(path)
-            self._aspect_ratio = _read_png_aspect_ratio(path)
-        self._aspect_ratio_path.parent.mkdir(parents=True, exist_ok=True)
-        self._aspect_ratio_path.write_text(f"{self._aspect_ratio}\n", encoding="utf-8")
-        return self._aspect_ratio
+            aspect_ratio = _read_png_aspect_ratio(path)
+        self._device_aspect_ratios[self._device_name] = aspect_ratio
+        return aspect_ratio
+
+    def _get_or_create_device_udid(self) -> str:
+        device_udid = self._device_udids[self._device_name]
+        if device_udid is not None:
+            return device_udid
+        udid = _find_first_device_udid(self._device_name)
+        if udid is None:
+            udid = _run_command(
+                [
+                    "xcrun",
+                    "simctl",
+                    "create",
+                    "main",
+                    f"com.apple.CoreSimulator.SimDeviceType.{self._device_name}",
+                ],
+                timeout=300,
+            ).strip()
+        if not udid:
+            raise RuntimeError("failed to create simulator device")
+        self._device_udids[self._device_name] = udid
+        return udid
 
 
 class _VMControllerHandler(BaseHTTPRequestHandler):
@@ -225,6 +243,16 @@ def _run_command(command: list[str], timeout: int = 30) -> str:
     return stdout
 
 
+def _run_command_allow_fail(command: list[str]) -> None:
+    subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
 def _capture_simulator_png(path: Path) -> None:
     _run_command(["xcrun", "simctl", "io", "booted", "screenshot", str(path)])
 
@@ -260,3 +288,16 @@ def _read_png_aspect_ratio(path: Path) -> float:
     if width is None or height is None or height <= 0:
         raise RuntimeError(f"could not parse screenshot dimensions from sips: {output}")
     return width / height
+
+
+def _find_first_device_udid(device_name: str) -> Optional[str]:
+    output = _run_command(["xcrun", "simctl", "list", "devices", "-j"])
+    data = json.loads(output)
+    devices = data.get("devices", {})
+    for _, entries in devices.items():
+        for entry in entries:
+            if entry.get("isAvailable") is True and entry.get("name") == device_name:
+                udid = entry.get("udid")
+                if udid:
+                    return udid
+    return None

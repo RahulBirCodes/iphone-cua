@@ -260,8 +260,12 @@ def _capture_simulator_png(path: Path) -> None:
 def _capture_simulator_base64() -> str:
     with tempfile.TemporaryDirectory() as tmp_dir:
         path = Path(tmp_dir) / "screen.png"
+        resized_path = Path(tmp_dir) / "screen_768.png"
         _capture_simulator_png(path)
-        data = path.read_bytes() if path.exists() else b""
+        _run_command(
+            ["sips", "--resampleWidth", "768", str(path), "--out", str(resized_path)]
+        )
+        data = resized_path.read_bytes() if resized_path.exists() else b""
     return base64.b64encode(data).decode("ascii")
 
 

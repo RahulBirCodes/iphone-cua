@@ -61,7 +61,9 @@ def _resolve_remote_python(ssh_base: list[str], fallback: str) -> str:
     return path if path else fallback
 
 
-def _write_plist(tmp_dir: Path, label: str, python_path: str, script_path: str, port: int) -> Path:
+def _write_plist(
+    tmp_dir: Path, label: str, python_path: str, script_path: str, port: int
+) -> Path:
     plist = tmp_dir / f"{label}.plist"
     plist.write_text(
         f"""<?xml version="1.0" encoding="UTF-8"?>\n"""
@@ -101,7 +103,9 @@ def _install_launch_agent(
     _run(ssh_base + [f"mkdir -p /Users/{args.user}/Library/LaunchAgents"])
     with tempfile.TemporaryDirectory() as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
-        plist = _write_plist(tmp_dir, label, python_path, script_remote_path, args.remote_port)
+        plist = _write_plist(
+            tmp_dir, label, python_path, script_remote_path, args.remote_port
+        )
         _run(scp_base + [str(plist), f"{args.user}@{args.host}:{plist_remote_path}"])
     _run(ssh_base + [f"launchctl unload {plist_remote_path} >/dev/null 2>&1 || true"])
     _run(ssh_base + [f"launchctl load {plist_remote_path}"])
@@ -168,7 +172,9 @@ def main() -> int:
         )
 
     label = "com.iphonecua.vmcontroller"
-    plist_remote_path, _ = _install_launch_agent(args, ssh_base, scp_base, label, remote_dir)
+    plist_remote_path, _ = _install_launch_agent(
+        args, ssh_base, scp_base, label, remote_dir
+    )
 
     tunnel_cmd = ssh_base[:-1] + [
         "-N",
@@ -190,7 +196,7 @@ def main() -> int:
         _prompt("Press Enter to continue to tap...", args.auto)
 
         print("Tap at (0.4, 0.4)")
-        result = _post_action(url, "tap", {"x": 0.4, "y": 0.4})
+        result = _post_action(url, "tap", {"x": 0.5, "y": 0.5})
         if result.get("error"):
             print(f"Error: {result['error']}")
         _prompt("Press Enter to finish...", args.auto)
@@ -231,7 +237,9 @@ def main() -> int:
     finally:
         tunnel.terminate()
         tunnel.wait(timeout=10)
-        _run(ssh_base + [f"launchctl unload {plist_remote_path} >/dev/null 2>&1 || true"])
+        _run(
+            ssh_base + [f"launchctl unload {plist_remote_path} >/dev/null 2>&1 || true"]
+        )
 
     return 0
 

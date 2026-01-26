@@ -10,7 +10,7 @@ import time
 import urllib.request
 import base64
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -139,21 +139,10 @@ def save_b64_image(b64_str: str, out_path: str) -> None:
         f.write(img_bytes)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="SSH into a VM, install vm_controller, and run manual action tests."
-    )
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--user", required=True)
-    parser.add_argument("--key", default=os.environ.get("VM_SSH_KEY"))
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--remote-dir", default="~/vm_controller_test")
-    parser.add_argument("--remote-port", type=int, default=8000)
-    parser.add_argument("--local-port", type=int, default=18000)
-    parser.add_argument("--python", default="python3")
-    parser.add_argument("--auto", action="store_true")
-    args = parser.parse_args()
-
+def _with_remote_controller(
+    args: argparse.Namespace,
+    run_actions: Callable[[str, argparse.Namespace], None],
+) -> int:
     ssh_base = _build_ssh_base(args)
     scp_base = _build_scp_base(args)
 
@@ -203,6 +192,19 @@ def main() -> int:
 
     url = f"http://127.0.0.1:{args.local_port}/action"
     try:
+        run_actions(url, args)
+    finally:
+        tunnel.terminate()
+        tunnel.wait(timeout=10)
+        _run(
+            ssh_base + [f"launchctl unload {plist_remote_path} >/dev/null 2>&1 || true"]
+        )
+
+    return 0
+
+
+def test_case_1(args: argparse.Namespace) -> int:
+    def run_actions(url: str, args: argparse.Namespace) -> None:
         print("Resetting simulator (disable bezels + erase)...")
         _post_action(url, "reset", {})
         _prompt("Press Enter to continue to tap...", args.auto)
@@ -249,14 +251,42 @@ def main() -> int:
             print(f"Error: {result['error']}")
         _prompt("Press Enter to finish...", args.auto)
 
-    finally:
-        tunnel.terminate()
-        tunnel.wait(timeout=10)
-        _run(
-            ssh_base + [f"launchctl unload {plist_remote_path} >/dev/null 2>&1 || true"]
-        )
+    return _with_remote_controller(args, run_actions)
 
-    return 0
+
+def test_case_2(args: argparse.Namespace) -> int:
+    def run_actions(url: str, _args: argparse.Namespace) -> None:
+        result = _post_action(url, "unknown_action", {})
+        error = result.get("error")
+        if not error:
+            raise RuntimeError("expected error for unknown_action, but none returned")
+        if not str(error).startswith("unknown_action"):
+            raise RuntimeError(f"unexpected error for unknown_action: {error}")
+
+    return _with_remote_controller(args, run_actions)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="SSH into a VM, install vm_controller, and run manual action tests."
+    )
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--user", required=True)
+    parser.add_argument("--key", default=os.environ.get("VM_SSH_KEY"))
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--remote-dir", default="~/vm_controller_test")
+    parser.add_argument("--remote-port", type=int, default=8000)
+    parser.add_argument("--local-port", type=int, default=18000)
+    parser.add_argument("--python", default="python3")
+    parser.add_argument("--auto", action="store_true")
+    args = parser.parse_args()
+
+    print("Running test case 1...")
+    if test_case_1(args) != 0:
+        return 1
+
+    print("Running test case 2...")
+    return test_case_2(args)
 
 
 if __name__ == "__main__":

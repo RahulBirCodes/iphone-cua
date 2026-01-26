@@ -2,74 +2,75 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional
-
-
-@dataclass(frozen=True)
-class VMInfo:
-    """Descriptor for a VM managed by the host controller.
-
-    Expected inputs:
-        - vm_id: Unique VM identifier on this host.
-        - vm_ip: IP or hostname reachable by clients.
-        - agent_port: Port of the guest agent HTTP server.
-
-    Expected outputs:
-        - Instances are immutable data carriers.
-    """
-
-    vm_id: str
-    vm_ip: str
-    agent_port: int
+import threading
+from typing import Dict, List, Optional, Set
+from .types import VMInfo
 
 
 class HostController:
-    """Tracks free/leased VMs and leases them for rollouts.
+    """Manages a pool of Tart VMs on a single host.
 
-    Expected inputs:
-        - vms: Initial list of VMInfo objects managed by this host.
-        - max_concurrent: Optional cap on concurrent leases.
+    # NOTE: Assumes Tart VMs are on a virtual network reachable from the host.
 
-    Expected outputs:
-        - acquire_vm() returns a VMInfo for the lease.
-        - release_vm() returns a bool or raises on failure.
+    Thread-safe: multiple agents can acquire/release VMs concurrently.
+
+    Attributes:
+        max_concurrent: Optional cap on concurrent leases.
     """
 
     def __init__(self, vms: List[VMInfo], max_concurrent: Optional[int] = None) -> None:
-        self.vms = vms
-        self.max_concurrent = max_concurrent
+        assert len(vms) > 0, "HostController must be initialized with at least one VM."
+        self._all_vms: Dict[str, VMInfo] = {vm.vm_id: vm for vm in vms}
+        self._free: Set[str] = {vm.vm_id for vm in vms}
+        self._leased: Set[str] = set()
+        self._max_concurrent = max_concurrent
+        lease_slots = len(vms)
+        if max_concurrent is not None:
+            lease_slots = min(lease_slots, max_concurrent)
+        self._lease_slots = threading.BoundedSemaphore(lease_slots)
+        self._state_lock = threading.Lock()
 
-    def acquire_vm(self) -> VMInfo:
-        """Lease a VM for a rollout.
+    def acquire_vm(
+        self,
+        timeout: Optional[float] = None,
+    ) -> VMInfo:
+        if not self._all_vms:
+            raise RuntimeError("No VMs available")
 
-        Expected inputs:
-            - None.
+        if timeout is None:
+            acquired = self._lease_slots.acquire()
+        else:
+            acquired = self._lease_slots.acquire(timeout=timeout)
 
-        Expected outputs:
-            - VMInfo for the leased VM.
-        """
-        raise NotImplementedError
+        if not acquired:
+            raise RuntimeError("Unable to acquire VM")
+
+        with self._state_lock:
+            if not self._free:
+                self._lease_slots.release()
+                raise RuntimeError("No VMs available")
+            vm_id = self._free.pop()
+            self._leased.add(vm_id)
+            return self._all_vms[vm_id]
 
     def release_vm(self, vm_id: str) -> bool:
-        """Release a previously leased VM back to the pool.
+        with self._state_lock:
+            if vm_id not in self._leased:
+                raise ValueError(f"VM {vm_id} is not currently leased")
 
-        Expected inputs:
-            - vm_id: Identifier of the VM to release.
-
-        Expected outputs:
-            - True if released; False or raise on failure.
-        """
-        raise NotImplementedError
+            self._leased.remove(vm_id)
+            self._free.add(vm_id)
+        self._lease_slots.release()
+        return True
 
     def list_vms(self) -> Dict[str, VMInfo]:
-        """Return a snapshot of VM lease status.
+        with self._state_lock:
+            return dict(self._all_vms)
 
-        Expected inputs:
-            - None.
+    def get_free_count(self) -> int:
+        with self._state_lock:
+            return len(self._free)
 
-        Expected outputs:
-            - Dict keyed by vm_id with VMInfo values.
-        """
-        raise NotImplementedError
-
+    def get_leased_count(self) -> int:
+        with self._state_lock:
+            return len(self._leased)

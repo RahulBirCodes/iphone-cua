@@ -206,6 +206,12 @@ class _VMControllerHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
+    def do_GET(self) -> None:
+        if self.path == "/heartbeat":
+            self._write_json(200, {"status": "ok"})
+            return
+        self._write_json(404, {"error": "not_found"})
+
     def do_POST(self) -> None:
         if self.path != "/action":
             self._write_json(404, {"screenshot_b64": "", "error": "unknown_endpoint"})

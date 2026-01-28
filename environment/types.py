@@ -11,10 +11,10 @@ class VMInfo:
 @dataclass
 class Turn:
     role: str
-    screenshot: bytes | None
+    screenshot: str | None
     raw_output: str | None
     action: dict | None
-    reward: float
+    reward: float | None
 
 
 @dataclass

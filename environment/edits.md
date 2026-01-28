@@ -1,9 +1,5 @@
 ## iPhoneEnv
 
-- vm_name not needed
-- vm_process??? don't get why this is needed
-- collect_rollout needs to take in an initial prompt with what the task is + setup initial turn with prompt and then initial screenshot
-- also create dummy parse and judge functions (maybe you pass into the init), if parsing fails, then give slight negative reward for that turn and continue. If the agent parsed_action is done (read vm_controller to see actions agent can take) or agent has reached max_turns, run judge function and add reward and return.
-- if \_send_action returns an error in the response (not that the vm controller is down), include that error in environment response to let the llm agent learn how to recover. HOWEVER IF IT'S AN ERROR BECAUSE THE VM_CONTROLLER COULD NOT GET THE RESPONSE, then crash the actor
-- when restarting vm, poll somehow by either waiting for ip to be up from tart or see if it's os can run commands yet (whatever is more robust) and if it goes over the deadline, quit it and crash the actor and let ray restart it
-- also ensure what kind of screenshot from vm_controller it returns so that you can see if you really need \_decode_screenshot
+- vm_name not needed, along with template and url. JUST save ip and port. don't actually implement anything with tart, just create an abstraction called create_vm which sets it up and sets the instance vars
+- in rollout and turn dataclass, we no longer need an "environment" role, there should just be, system, user, and assistant. All environment responses are included in user and since user and system messages will be masked during training this should be fine. The screenshot should also be in base64 format. you want to include in the conversation an initial fixed system prompt that's passed in, then after that add another separate turn that is from user with the task (NO SCREENSHOT!), then after that another separate turn from the user which includes the initial observation from simulator. The reasoning is that this is so that the kv cache for inference is able to cache maximum length prefixes without invalidation. also DO NOT add the judge result to the end of the rollout.
+- create a yaml file template which serves as a config file for what hosts are currently available and the maximum # of resource (vm_controllers) that can be spawned up on each one. Then create a bash script that starts ray on these hosts with specified limits. Set the first host as the head node

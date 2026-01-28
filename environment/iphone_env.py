@@ -1,76 +1,102 @@
 from __future__ import annotations
 
-import base64
+import socket
+import subprocess
 import sys
 import time
-import uuid
 from typing import Callable, Optional
 
 import requests
 
 import ray
 
+CONTROLLER_PORT = 8000
+VM_IP_TIMEOUT = 60
+VM_PORT_TIMEOUT = 60
+
 from .types import RolloutResult, Turn
 
+ParseResult = dict | tuple[dict, float]
 
-@ray.remote(resources={"iPhone_Slot": 1})
+
+@ray.remote(resources={"iphone_slot": 1})
 class iPhoneEnv:
     # vm_ip is ip available on virtual address in host
     def __init__(
         self,
-        vm_template: str,
-        vm_port: int = 8000,
-        parse_fn: Optional[Callable[[str], Optional[dict]]] = None,
+        base_image: str,
+        parse_fn: Optional[Callable[[str], Optional[ParseResult]]] = None,
         judge_fn: Optional[Callable[[list[Turn], str, str], float]] = None,
     ):
-        self._vm_template = vm_template
-        self._vm_port = vm_port
-        self._vm_name = f"{vm_template}-{uuid.uuid4().hex[:8]}"
-        self._vm_ip = ""
-        self._vm_url = ""
+        self._base_image = base_image
         self._session = requests.Session()
         self._parse_fn = parse_fn or _default_parse
         self._judge_fn = judge_fn or _default_judge
-        self._create_vm()
+        self.create_vm()
 
     def collect_rollout(
-        self, task_id: str, task_prompt: str, max_turns: int
+        self,
+        system_prompt: str,
+        task_id: str,
+        task_prompt: str,
+        max_turns: int,
     ) -> RolloutResult:
         turns: list[Turn] = []
         try:
             turns.append(
                 Turn(
-                    role="environment",
+                    role="system",
+                    screenshot=None,
+                    raw_output=system_prompt,
+                    action=None,
+                    reward=None,
+                )
+            )
+            turns.append(
+                Turn(
+                    role="user",
                     screenshot=None,
                     raw_output=task_prompt,
                     action=None,
-                    reward=0.0,
+                    reward=None,
                 )
             )
             screenshot = self._reset()
             turns.append(
                 Turn(
-                    role="environment",
+                    role="user",
                     screenshot=screenshot,
                     raw_output=None,
                     action=None,
-                    reward=0.0,
+                    reward=None,
                 )
             )
             for _ in range(max_turns):
                 raw_output = self._get_action(screenshot)
-                parsed_action = self._parse_fn(raw_output)
+                parsed_action: dict = {"action": "observe", "params": {}}
                 parse_reward = 0.0
-                if parsed_action is None:
+                parse_result = self._parse_fn(raw_output)
+                if parse_result is None:
                     parse_reward = -0.1
-                    parsed_action = {"action": "observe", "params": {}}
+                elif isinstance(parse_result, tuple):
+                    parsed_action, parse_reward = parse_result
+                    if not isinstance(parsed_action, dict):
+                        parsed_action = {"action": "observe", "params": {}}
+                        parse_reward = -0.1
+                elif isinstance(parse_result, dict):
+                    parsed_action = parse_result
+                else:
+                    parse_reward = -0.1
+                assistant_reward = parse_reward
+                if _is_done_action(parsed_action):
+                    assistant_reward = self._judge_fn(turns, task_id, task_prompt)
                 turns.append(
                     Turn(
-                        role="agent",
+                        role="assistant",
                         screenshot=None,
                         raw_output=raw_output,
                         action=parsed_action,
-                        reward=parse_reward,
+                        reward=assistant_reward,
                     )
                 )
                 if _is_done_action(parsed_action):
@@ -78,28 +104,18 @@ class iPhoneEnv:
                 screenshot, env_error = self._step(parsed_action)
                 turns.append(
                     Turn(
-                        role="environment",
+                        role="user",
                         screenshot=screenshot,
                         raw_output=env_error,
                         action=None,
-                        reward=0.0,
+                        reward=None,
                     )
                 )
-            judge_reward = self._judge_fn(turns, task_id, task_prompt)
-            turns.append(
-                Turn(
-                    role="environment",
-                    screenshot=None,
-                    raw_output="judge",
-                    action=None,
-                    reward=judge_reward,
-                )
-            )
             return RolloutResult(turns=turns, task_id=task_id)
         except Exception:
             sys.exit(1)
 
-    def _reset(self) -> bytes:
+    def _reset(self) -> str:
         _, error = self._send_action("reset", {})
         if error:
             raise RuntimeError(error)
@@ -108,7 +124,7 @@ class iPhoneEnv:
             raise RuntimeError(error)
         return screenshot
 
-    def _step(self, action: dict) -> tuple[bytes, str | None]:
+    def _step(self, action: dict) -> tuple[str, str | None]:
         if not isinstance(action, dict):
             raise ValueError("action must be a dict")
         action_name = str(action.get("action", "")).strip()
@@ -120,10 +136,10 @@ class iPhoneEnv:
         screenshot, error = self._send_action(action_name, params)
         return screenshot, error
 
-    def _send_action(self, action: str, params: dict) -> tuple[bytes, str | None]:
+    def _send_action(self, action: str, params: dict) -> tuple[str, str | None]:
         try:
             resp = self._session.post(
-                f"{self._vm_url}/action",
+                f"http://{self._vm_ip}:{self._vm_port}/action",
                 json={"action": action, "params": params},
                 timeout=30,
             )
@@ -135,11 +151,15 @@ class iPhoneEnv:
             raise RuntimeError(f"invalid_response:{exc}") from exc
         error = data.get("error")
         screenshot_b64 = data.get("screenshot_b64", "")
-        return _decode_screenshot(screenshot_b64), error
+        if not isinstance(screenshot_b64, str):
+            screenshot_b64 = ""
+        return _normalize_screenshot_b64(screenshot_b64), error
 
     def _check_heartbeat(self) -> bool:
         try:
-            resp = self._session.get(f"{self._vm_url}/heartbeat", timeout=2)
+            resp = self._session.get(
+                f"http://{self._vm_ip}:{self._vm_port}/heartbeat", timeout=2
+            )
             data = resp.json()
         except Exception:
             return False
@@ -150,70 +170,52 @@ class iPhoneEnv:
             return
         raise RuntimeError("vm is not reachable")
 
-    def _create_vm(self) -> None:
-        try:
-            subprocess.run(
-                ["tart", "clone", self._vm_template, self._vm_name],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            subprocess.Popen(
-                ["tart", "run", self._vm_name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            self._vm_ip = _wait_for_vm_ip(self._vm_name)
-            self._vm_url = f"http://{self._vm_ip}:{self._vm_port}"
-            deadline = time.time() + 120
-            while time.time() < deadline:
-                if self._check_heartbeat():
-                    return
-                time.sleep(2)
-            raise RuntimeError("vm did not become healthy")
-        except Exception:
-            sys.exit(1)
+    def create_vm(self) -> None:
+        actor_id = ray.get_runtime_context().get_actor_id()
+        vm_name = f"rollout-{actor_id}"
+        subprocess.run(["tart", "delete", vm_name], capture_output=True)
+        # should be local img
+        subprocess.run(["tart", "clone", self._base_image, vm_name], check=True)
+        subprocess.Popen(["tart", "run", vm_name, "--no-graphics"])
+        vm_ip = self._wait_for_ip(vm_name, timeout=VM_IP_TIMEOUT)
+        self._wait_for_port(vm_ip, CONTROLLER_PORT, timeout=VM_PORT_TIMEOUT)
 
-    def _get_action(self, screenshot: bytes) -> str:
+        self._vm_id = vm_name
+        self._vm_ip = vm_ip
+        self._vm_port = CONTROLLER_PORT
+
+    def _wait_for_ip(self, vm_name: str, timeout: float) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = subprocess.run(
+                ["tart", "ip", vm_name], capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+            time.sleep(0.5)
+        raise RuntimeError(f"VM {vm_name} did not get IP within {timeout}s")
+
+    def _wait_for_port(self, ip: str, port: int, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((ip, port), timeout=1):
+                    return
+            except (socket.timeout, ConnectionRefusedError, OSError):
+                time.sleep(0.5)
+        raise RuntimeError(f"Controller at {ip}:{port} not ready within {timeout}s")
+
+    def _get_action(self, screenshot: str) -> str:
         _ = screenshot
         return ""
 
 
-def _decode_screenshot(b64_str: str) -> bytes:
+def _normalize_screenshot_b64(b64_str: str) -> str:
     if not b64_str:
-        return b""
+        return ""
     if b64_str.startswith("data:"):
         _, _, b64_str = b64_str.partition(",")
-    try:
-        return base64.b64decode(b64_str)
-    except Exception:
-        return b""
-
-def _wait_for_vm_ip(vm_name: str) -> str:
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        vm_ip = _get_vm_ip(vm_name)
-        if vm_ip:
-            return vm_ip
-        time.sleep(2)
-    raise RuntimeError("unable to fetch vm ip")
-
-
-def _get_vm_ip(vm_name: str) -> str | None:
-    result = subprocess.run(
-        ["tart", "ip", vm_name],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=15,
-    )
-    if result.returncode != 0:
-        return None
-    ip = result.stdout.strip()
-    return ip or None
+    return b64_str
 
 
 def _default_parse(raw_output: str) -> Optional[dict]:

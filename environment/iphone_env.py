@@ -72,24 +72,22 @@ class iPhoneEnv:
                 )
             )
             for _ in range(max_turns):
-                raw_output = self._get_action(screenshot)
-                parsed_action: dict = {"action": "observe", "params": {}}
-                parse_reward = 0.0
+                raw_output = self._get_llm_resp(turns)
                 parse_result = self._parse_fn(raw_output)
                 if parse_result is None:
+                    parsed_action = {"action": "observe", "params": {}}
                     parse_reward = -0.1
                 elif isinstance(parse_result, tuple):
                     parsed_action, parse_reward = parse_result
-                    if not isinstance(parsed_action, dict):
-                        parsed_action = {"action": "observe", "params": {}}
-                        parse_reward = -0.1
-                elif isinstance(parse_result, dict):
-                    parsed_action = parse_result
                 else:
-                    parse_reward = -0.1
+                    parsed_action = parse_result
+                    parse_reward = 0.0
+
                 assistant_reward = parse_reward
-                if _is_done_action(parsed_action):
+                is_done = _is_done_action(parsed_action)
+                if is_done:
                     assistant_reward = self._judge_fn(turns, task_id, task_prompt)
+
                 turns.append(
                     Turn(
                         role="assistant",
@@ -99,7 +97,7 @@ class iPhoneEnv:
                         reward=assistant_reward,
                     )
                 )
-                if _is_done_action(parsed_action):
+                if is_done:
                     break
                 screenshot, env_error = self._step(parsed_action)
                 turns.append(
@@ -125,16 +123,9 @@ class iPhoneEnv:
         return screenshot
 
     def _step(self, action: dict) -> tuple[str, str | None]:
-        if not isinstance(action, dict):
-            raise ValueError("action must be a dict")
-        action_name = str(action.get("action", "")).strip()
+        action_name = action["action"]
         params = action.get("params", {})
-        if not action_name:
-            raise ValueError("action missing name")
-        if not isinstance(params, dict):
-            params = {}
-        screenshot, error = self._send_action(action_name, params)
-        return screenshot, error
+        return self._send_action(action_name, params)
 
     def _send_action(self, action: str, params: dict) -> tuple[str, str | None]:
         try:
@@ -154,21 +145,6 @@ class iPhoneEnv:
         if not isinstance(screenshot_b64, str):
             screenshot_b64 = ""
         return _normalize_screenshot_b64(screenshot_b64), error
-
-    def _check_heartbeat(self) -> bool:
-        try:
-            resp = self._session.get(
-                f"http://{self._vm_ip}:{self._vm_port}/heartbeat", timeout=2
-            )
-            data = resp.json()
-        except Exception:
-            return False
-        return data.get("status") == "ok"
-
-    def _ensure_vm_running(self) -> None:
-        if self._check_heartbeat():
-            return
-        raise RuntimeError("vm is not reachable")
 
     def create_vm(self) -> None:
         actor_id = ray.get_runtime_context().get_actor_id()
@@ -205,7 +181,7 @@ class iPhoneEnv:
                 time.sleep(0.5)
         raise RuntimeError(f"Controller at {ip}:{port} not ready within {timeout}s")
 
-    def _get_action(self, screenshot: str) -> str:
+    def _get_llm_resp(self, screenshot: str) -> str:
         _ = screenshot
         return ""
 
@@ -219,6 +195,13 @@ def _normalize_screenshot_b64(b64_str: str) -> str:
 
 
 def _default_parse(raw_output: str) -> Optional[dict]:
+    """Parse raw LLM output into an action.
+
+    Parse functions must return one of:
+    - dict with "action" key (non-empty string) and "params" key (dict)
+    - tuple[dict, float] with same dict structure and a reward value
+    - None for parse failures (will use fallback action with -0.1 penalty)
+    """
     _ = raw_output
     return {"action": "observe", "params": {}}
 

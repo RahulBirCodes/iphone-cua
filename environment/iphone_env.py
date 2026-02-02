@@ -14,7 +14,7 @@ CONTROLLER_PORT = 8000
 VM_IP_TIMEOUT = 60
 VM_PORT_TIMEOUT = 60
 
-from .types import RolloutResult, Turn
+from .schemas import RolloutResult, Turn
 
 ParseResult = dict | tuple[dict, float]
 

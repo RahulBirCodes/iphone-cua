@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import socket
 import subprocess
 import sys
 import time
-from typing import Callable, Optional
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -14,7 +17,7 @@ CONTROLLER_PORT = 8000
 VM_IP_TIMEOUT = 60
 VM_PORT_TIMEOUT = 60
 
-from .schemas import RolloutResult, Turn
+from .schemas import RolloutResult, TerminationReason, Turn
 
 ParseResult = dict | tuple[dict, float]
 
@@ -40,11 +43,17 @@ class iPhoneEnv:
         task_id: str,
         task_prompt: str,
         max_turns: int,
+        save_json: bool = False,
+        save_path: str | None = None,
     ) -> RolloutResult:
         turns: list[Turn] = []
+        termination_reason: TerminationReason | None = None
+        final_reward: float | None = None
+
         try:
             turns.append(
                 Turn(
+                    t=len(turns),
                     role="system",
                     screenshot=None,
                     raw_output=system_prompt,
@@ -54,6 +63,7 @@ class iPhoneEnv:
             )
             turns.append(
                 Turn(
+                    t=len(turns),
                     role="user",
                     screenshot=None,
                     raw_output=task_prompt,
@@ -61,18 +71,23 @@ class iPhoneEnv:
                     reward=None,
                 )
             )
-            screenshot = self._reset()
-            turns.append(
-                Turn(
-                    role="user",
-                    screenshot=screenshot,
-                    raw_output=None,
-                    action=None,
-                    reward=None,
-                )
-            )
+            _, error = self._send_action("reset", {})
+            if error:
+                raise RuntimeError(error)
+            next_action: dict = {"action": "observe", "params": {}}
             for _ in range(max_turns):
-                raw_output = self._get_llm_resp(turns)
+                screenshot, env_error = self._step(next_action)
+                turns.append(
+                    Turn(
+                        t=len(turns),
+                        role="user",
+                        screenshot=screenshot,
+                        raw_output=env_error,
+                        action=None,
+                        reward=None,
+                    )
+                )
+                raw_output = self._get_llm_resp(screenshot)
                 parse_result = self._parse_fn(raw_output)
                 if parse_result is None:
                     parsed_action = {"action": "observe", "params": {}}
@@ -86,10 +101,12 @@ class iPhoneEnv:
                 assistant_reward = parse_reward
                 is_done = _is_done_action(parsed_action)
                 if is_done:
-                    assistant_reward = self._judge_fn(turns, task_id, task_prompt)
+                    final_reward = self._judge_fn(turns, task_id, task_prompt)
+                    assistant_reward = final_reward
 
                 turns.append(
                     Turn(
+                        t=len(turns),
                         role="assistant",
                         screenshot=None,
                         raw_output=raw_output,
@@ -98,29 +115,23 @@ class iPhoneEnv:
                     )
                 )
                 if is_done:
+                    termination_reason = TerminationReason.DONE
                     break
-                screenshot, env_error = self._step(parsed_action)
-                turns.append(
-                    Turn(
-                        role="user",
-                        screenshot=screenshot,
-                        raw_output=env_error,
-                        action=None,
-                        reward=None,
-                    )
-                )
-            return RolloutResult(turns=turns, task_id=task_id)
+                next_action = parsed_action
+            else:
+                termination_reason = TerminationReason.TRUNCATED
+
+            result = RolloutResult(
+                turns=turns,
+                task_id=task_id,
+                termination_reason=termination_reason,
+                final_reward=final_reward,
+            )
+            if save_json:
+                self._save_rollout_json(result, save_path)
+            return result
         except Exception:
             sys.exit(1)
-
-    def _reset(self) -> str:
-        _, error = self._send_action("reset", {})
-        if error:
-            raise RuntimeError(error)
-        screenshot, error = self._send_action("observe", {})
-        if error:
-            raise RuntimeError(error)
-        return screenshot
 
     def _step(self, action: dict) -> tuple[str, str | None]:
         action_name = action["action"]
@@ -185,6 +196,15 @@ class iPhoneEnv:
         _ = screenshot
         return ""
 
+    def _save_rollout_json(self, result: RolloutResult, save_path: str | None) -> None:
+        if save_path:
+            path = Path(save_path)
+        else:
+            path = Path("rollouts") / f"{result.task_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _rollout_to_dict(result)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
 
 def _normalize_screenshot_b64(b64_str: str) -> str:
     if not b64_str:
@@ -216,3 +236,11 @@ def _default_judge(turns: list[Turn], task_id: str, task_prompt: str) -> float:
 def _is_done_action(action: dict) -> bool:
     action_name = str(action.get("action", "")).strip().lower()
     return action_name in {"done", "finish", "stop"}
+
+
+def _rollout_to_dict(result: RolloutResult) -> dict[str, Any]:
+    payload = asdict(result)
+    termination_reason = payload.get("termination_reason")
+    if isinstance(termination_reason, TerminationReason):
+        payload["termination_reason"] = termination_reason.value
+    return payload

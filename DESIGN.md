@@ -54,7 +54,7 @@ Ray Driver / Trainer
 ## Files (entry points)
 
 - `iphone_env.py` — Ray actor + rollout loop + VM lifecycle
-- `vllm_inference.py` — Ray vLLM actor for async inference (TP=2)
+- `inference/vllm_inference.py` — Ray vLLM actor for async inference (TP=2)
 - `vm_controller.py` — HTTP server inside VM that drives Simulator
 - `ray_cluster.template.yaml` — host inventory + resource limits
 - `start_ray_cluster.sh` — starts Ray head/workers with resource caps

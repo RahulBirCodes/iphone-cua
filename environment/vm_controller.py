@@ -17,6 +17,7 @@ class VMController:
 
     Allowed actions (from `new_arch/guest_agent.py`):
         - tap: {x, y}
+        - long_press: {x, y}
         - swipe: {x1, y1, x2, y2}
         - type_text: {text}
         - go_home: {}
@@ -40,6 +41,7 @@ class VMController:
         self._device_aspect_ratios: Dict[str, float] = {}
         self._handlers: Dict[str, Callable[[Dict[str, Any]], None]] = {
             "tap": self._handle_tap,
+            "long_press": self._handle_long_press,
             "swipe": self._handle_swipe,
             "type_text": self._handle_type_text,
             "go_home": self._handle_go_home,
@@ -71,6 +73,17 @@ class VMController:
         time.sleep(0.02)
         controller.press(mouse.Button.left)
         time.sleep(0.02)
+        controller.release(mouse.Button.left)
+
+    def _handle_long_press(self, params: Dict[str, Any]) -> None:
+        x = float(params.get("x", 0.0))
+        y = float(params.get("y", 0.0))
+        abs_x, abs_y = self._normalized_to_screen(x, y)
+        controller = mouse.Controller()
+        controller.position = (abs_x, abs_y)
+        time.sleep(0.02)
+        controller.press(mouse.Button.left)
+        time.sleep(0.5)
         controller.release(mouse.Button.left)
 
     def _handle_swipe(self, params: Dict[str, Any]) -> None:

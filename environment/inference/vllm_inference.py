@@ -8,25 +8,16 @@ from transformers import AutoTokenizer
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 
-TP_SIZE = 1
-MAX_CONCURRENCY = 128
+from .inference_actor import InferenceActor
+from .schemas import MAX_CONCURRENCY, TP_SIZE
 
-
-def default_chat_template(messages: Iterable[dict[str, Any]]) -> str:
-    parts = []
-    for message in messages:
-        role = message.get("role", "user")
-        content = message.get("content", "")
-        parts.append(f"{role}: {content}")
-    parts.append("assistant:")
-    return "\n".join(parts)
 
 
 @ray.remote(
     max_concurrency=MAX_CONCURRENCY,
     resources={"inference_node": 1},
 )
-class VLLMActor:
+class VLLMActor(InferenceActor):
     def __init__(self, model: str, **engine_kwargs: Any):
         engine_args = AsyncEngineArgs(
             model=model,
@@ -48,7 +39,7 @@ class VLLMActor:
             )
         except Exception:
             # Fallback for tiny models without a chat template.
-            return default_chat_template(msg_list)
+            return super().format_messages(msg_list)
 
     async def generate(
         self,

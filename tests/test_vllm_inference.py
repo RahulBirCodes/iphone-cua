@@ -6,19 +6,16 @@ from pathlib import Path
 # can't query process parents.
 os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
-# Default to CPU execution unless explicitly overridden.
-_test_num_gpus = int(os.environ.get("VLLM_TEST_NUM_GPUS", "0"))
-
 import ray
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vllm_inference import VLLMActor
+from inference.vllm_inference import VLLMActor
 
 
-def test_vllm_actor_generate_final_completion():
+def test_vllm_actor_generate_final_completion() -> None:
     num_gpus = int(os.environ.get("VLLM_TEST_NUM_GPUS", "0"))
     ray.init(
         address="local",
@@ -28,7 +25,7 @@ def test_vllm_actor_generate_final_completion():
     )
     try:
         model_id = os.environ.get("VLLM_TEST_MODEL", "distilgpt2")
-        actor = VLLMActor.options(num_gpus=_test_num_gpus).remote(
+        actor = VLLMActor.options(num_gpus=num_gpus).remote(
             model=model_id, max_model_len=256
         )
         messages = [
@@ -43,13 +40,7 @@ def test_vllm_actor_generate_final_completion():
             )
         )
         print("\n\n VLLM ACTOR OUTPUT:", output, "\n\n")
+        assert isinstance(output, str)
+        assert output.strip()
     finally:
         ray.shutdown()
-
-
-def main() -> None:
-    test_vllm_actor_generate_final_completion()
-
-
-if __name__ == "__main__":
-    main()

@@ -2,11 +2,18 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-@dataclass(frozen=True)
-class VMInfo:
-    vm_id: str
-    vm_ip: str
-    agent_port: int
+@dataclass
+class ParsedOutput:
+    reasoning: str
+    content: str
+    action: dict | None
+
+
+@dataclass
+class RewardPolicy:
+    parse_penalty: float = 0.0
+    success_reward: float = 1.0
+    failure_penalty: float = 0.0
 
 
 @dataclass
@@ -15,6 +22,7 @@ class Turn:
     role: str
     screenshot: str | None
     raw_output: str | None
+    parsed_output: "ParsedOutput | None"
     action: dict | None
     reward: float | None
 
@@ -23,6 +31,10 @@ class TerminationReason(str, Enum):
     FAIL = "Fail"
     DONE = "Done"
     TRUNCATED = "Truncated"
+
+
+class EnvRuntimeError(RuntimeError):
+    pass
 
 
 @dataclass

@@ -58,25 +58,10 @@ def train_model(config: TrainingConfig, data: Dataset) -> TrainedModel:
     ...
 ```
 
-### Abstraction Principles
-
-- **Separation of Concerns**: Data (datasets/dataloaders), Logic (training/inference), Configuration (configs)
-- **Module Organization**: Put reusable code in or `core/`, feature code in similar folders (for example all inference related features under inference, parsing, under parsing...)
-- **Protocol-Oriented Design (CRITICAL FOR TESTING)**:
-  - Define abstract base classes (ABCs) or Protocols for ALL services and external dependencies
-  - This enables creating mock/dummy implementations for pytest
-  - Examples: `InferenceEngineProtocol`, `DataLoaderProtocol`, `CheckpointManagerProtocol`
-  - Every concrete implementation should have a corresponding protocol/ABC
-- **Dependency Injection**:
-  - Pass dependencies through `__init__` parameters, not global state
-  - Use protocol/ABC types in signatures: `def __init__(self, engine: InferenceEngineProtocol)`
-  - This allows injecting mocks during testing
-
 ## Architecture Document Structure
 
 Write to `current-feature/architecture.md`:
 
-````markdown
 # Architecture: [Feature Name]
 
 ## Overview
@@ -88,24 +73,6 @@ Brief technical summary (2-3 sentences).
 ### [Capability Group 1: Logical Name]
 
 **1. Data Structures**
-
-```python
-# New/changed classes, dataclasses, protocols/ABCs
-# CRITICAL: Define protocols/ABCs for all services/dependencies for testability
-from typing import Protocol
-from abc import ABC, abstractmethod
-
-class ServiceNameProtocol(Protocol):
-    """Protocol for service interface"""
-    def method_name(self, param: type) -> return_type: ...
-
-@dataclass
-class DataClassName:
-    """Data structure for X"""
-    field1: type
-    field2: type
-```
-````
 
 **2. Implementation Algorithm**
 
@@ -150,84 +117,8 @@ Note: Organize by logical component (e.g., inference/, training/, data_pipeline/
 
 ---
 
-[Repeat for each capability group...]
-
-## Distributed Computing Changes (if applicable)
-
-Follow the same capability structure for distributed components:
-
-### [Capability Group: Logical Name]
-
-**1. Data Structures**
-
-- Ray actors/tasks structure
-- Message passing protocols
-- Shared state management
-
-**2. Implementation Algorithm**
-
-- Distribution logic
-- Communication patterns
-- Failure handling
-
-**3. Files**
-
-- New distributed components: `[component_name]/[file_name].py`
-- Modified files: [list]
-
-## Testability Strategy
-
-### Protocols for Testing
-
-List all protocols that enable mocking and testing:
-
-- `[ServiceName]Protocol`: [purpose, key methods]
-- `[RepositoryName]Protocol`: [purpose, key methods]
-
-### Dependency Injection Points
-
-Where dependencies are injected:
-
-- `[ViewModel/Service]`: Uses `[Protocol]` injected via init
-- `[Component]`: Uses `[Protocol]` passed as parameter
-
-### Mockable Components
-
-Components designed for easy mocking:
-
-- `[Component 1]`: Can be mocked via `[Protocol]`
-- `[Component 2]`: Testable with dummy `[Type]`
-
 ## Key Architectural Decisions
 
-- [Decision 1]: [Rationale]
-- [Decision 2]: [Rationale]
-
-```
-
-## What to Include vs. Exclude
-
-### ✅ Include (Per Capability)
-
-- **Logical grouping** of related capabilities (e.g., "Data Pipeline", "Training Loop", "Distributed Inference")
-- **Data Structures**: Class/dataclass shapes with key properties and types
-- **Protocols/ABCs (CRITICAL)**: Define protocols/ABCs for ALL services and dependencies to enable testing
-- **Algorithm**: High-level pseudocode showing the flow (numbered steps, no actual code)
-- **Files**: Exact paths for new files and which existing files need modification
-- **State transition diagrams/enums** when modeling flows
-- **Component boundaries and protocols** for dependency injection
-- **Testability Strategy**: Which components are mockable, what protocols enable testing
-- **Dependency injection points**: Where and how dependencies are injected
-- **Test cases** (English descriptions per capability)
-
-### ❌ Exclude
-
-- Actual Python implementation code
-- Detailed tensor operations or model architecture code
-- Specific hyperparameter values (those go in configs)
-- Line-by-line logic
-- Low-level optimization details
-- Migration timelines or phasing plans - this is a design doc, not a project plan
 
 ## Output
 
@@ -261,4 +152,7 @@ Next: Run the implementer agent to build this feature.
 ## Remember
 
 You're the architect, not the builder. Define the blueprint clearly enough that an implementer can build it, but don't write the code yourself.
+
+```
+
 ```

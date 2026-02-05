@@ -28,6 +28,7 @@ No new structures. Use existing `EnvRuntimeError` from `environment/schemas.py`.
 **3. Files**
 
 Modified files:
+
 - `environment/iphone_env.py` — Change `observe` error handling to raise `EnvRuntimeError` instead of passing error as feedback
 
 ---
@@ -64,13 +65,33 @@ No new structures.
 **3. Files**
 
 Modified files:
+
 - `environment/iphone_env.py` — Rewrite `_build_user_text`, update first user turn in `collect_rollout`
 
 ---
 
 ### 3. XML Action Parsing
 
-**Problem:** Need a standalone parser that extracts self-closing XML action tags from model output, separates reasoning from action, and returns structured results. Must support Qwen3-VL's `<think>...</think>` reasoning traces.
+**Problem:** Need a standalone parser that extracts self-closing XML action tags from model output, separates reasoning from action, and returns structured results. Must work with Qwen3-VL's chat template where `add_generation_prompt=True` opens `<think>` in the prompt, and the model closes it in its output.
+
+**Key invariant:** `add_generation_prompt` opens `<think>` in the PROMPT. The model closes it in the OUTPUT. Everything after `</think>` is the action.
+
+**Generation context:** When `apply_chat_template(..., add_generation_prompt=True)` is called, the template appends:
+
+```
+<|im_start|>assistant
+<think>
+```
+
+So the model begins generating _inside_ the think block. It does NOT output an opening `<think>` tag itself. A typical raw model completion looks like:
+
+```
+(reasoning text here...)
+</think>
+
+<tap x="0.42" y="0.77" />
+<|im_end|>
+```
 
 **1. Data Structures**
 
@@ -79,28 +100,30 @@ In `environment/schemas.py`:
 ```python
 @dataclass
 class ParsedOutput:
-    reasoning: str | None      # Text inside <think>...</think> or None
+    reasoning: str | None      # Text before </think> (model's CoT reasoning)
     action_text: str | None    # Raw XML action tag string (e.g., '<tap x="0.42" y="0.77" />')
     action: dict | None        # Parsed {"action": str, "params": dict} or None on failure
     error: str | None          # Parse error message if action extraction failed
 ```
 
 Update `Turn`:
+
 ```python
 @dataclass
 class Turn:
     t: int
     role: str
     screenshot: str | None
-    raw_output: str | None
+    raw_output: str | None         # Store raw model completion verbatim
     parsed_output: ParsedOutput | None  # NEW: breakdown of LLM response
-    action: dict | None                 # Keep for backward compat; same as parsed_output.action
+    action: dict | None            # Keep for backward compat; same as parsed_output.action
     reward: float | None
 ```
 
 **2. Implementation Algorithm**
 
 Allowed actions and their parameter schemas:
+
 ```
 tap(x: float, y: float)
 long_press(x: float, y: float)
@@ -114,26 +137,31 @@ finished()
 
 XML format: `<action_name attr1="val1" attr2="val2" />`
 
-Parsing algorithm:
+Parsing algorithm (input is the raw model completion string):
+
 ```
 parse(raw_output: str) -> ParsedOutput:
 
-1. Strip special tokens
-   - Remove <|im_end|>, <|im_start|>, trailing whitespace
+1. Strip special tokens + whitespace
+   - Remove trailing/embedded <|im_end|> (and any similar end markers)
+   - text = text.strip()
 
 2. Split reasoning vs action region
-   - If "</think>" present in text:
-     - reasoning = everything before "</think>" (strip leading "<think>" if present)
-     - action_region = everything after "</think>" (stripped)
-   - Else:
-     - reasoning = None
-     - action_region = full text (stripped)
+   - Look for the literal substring "</think>"
+   - If "</think>" exists:
+     - reasoning_text = everything BEFORE "</think>" (trimmed)
+     - action_region  = everything AFTER "</think>" (trimmed)
+   - If "</think>" does NOT exist:
+     - reasoning_text = "" (empty string)
+     - action_region  = entire output (trimmed)
+   - NOTE: The model does NOT output an opening <think> — that's in the prompt.
+     If a leading <think> somehow appears in the output, strip it from reasoning_text.
 
-3. Extract action tag from action_region
+3. Extract exactly one action tag from action_region
    - Use regex to find self-closing XML tags: <(tag_name) ... />
    - Only match tags in ALLOWED_ACTIONS = {tap, long_press, swipe, type_text, go_home, wait, fail, finished}
-   - If 0 matching tags found: return ParsedOutput(reasoning, None, None, error="no_action_tag_found")
-   - If >1 matching tags found: return ParsedOutput(reasoning, None, None, error="multiple_action_tags")
+   - If 0 matching tags found: return ParsedOutput(reasoning_text, None, None, error="no_action_tag_found")
+   - If >1 matching tags found: return ParsedOutput(reasoning_text, None, None, error="multiple_action_tags")
    - If exactly 1: proceed to attribute parsing
 
 4. Parse attributes from the matched tag
@@ -144,25 +172,35 @@ parse(raw_output: str) -> ParsedOutput:
      - swipe: start_x (float 0-1), start_y (float 0-1), end_x (float 0-1), end_y (float 0-1)
      - type_text: text (str, required)
      - go_home, wait, fail, finished: no params
-   - If validation fails: return ParsedOutput(reasoning, tag_text, None, error="invalid_params: ...")
+   - If validation fails: return ParsedOutput(reasoning_text, tag_text, None, error="invalid_params: ...")
 
 5. Return ParsedOutput(
-     reasoning=reasoning,
+     reasoning=reasoning_text,
      action_text=matched_tag_string,
      action={"action": tag_name, "params": {validated params}},
      error=None
    )
 ```
 
+**What gets stored vs reused:**
+
+- `Turn.raw_output` = exact model completion verbatim (for logging/debugging)
+- `Turn.parsed_output` = structured breakdown (reasoning, action, error)
+- Reasoning text does NOT get fed back into the next prompt (avoids context bloat)
+- Next prompt includes: system instructions, current observation (screenshot + JSON), optional short action history
+- Full reasoning traces stay in logs, not in the prompt
+
 **3. Files**
 
 New files:
+
 - `environment/action_parser.py` — Standalone XML action parser with `parse(raw_output: str) -> ParsedOutput`
   - Contains: `ALLOWED_ACTIONS` dict mapping action name -> param schema
   - Contains: `parse()` function implementing the algorithm above
   - Contains: param validation helpers (float range check, required field check)
 
 Modified files:
+
 - `environment/schemas.py` — Add `ParsedOutput` dataclass
 - `environment/iphone_env.py` — Replace `_default_parse` and `_extract_action` with the new parser:
   - `_parse_fn` signature becomes `Callable[[str], ParsedOutput]`
@@ -214,12 +252,13 @@ Reward accumulation during rollout:
 **3. Files**
 
 Modified files:
+
 - `environment/schemas.py` — Add `RewardPolicy` dataclass
 - `environment/iphone_env.py`:
   - `iPhoneEnv.__init__` accepts `reward_policy: RewardPolicy` (default `RewardPolicy()`)
   - `collect_rollout` tracks cumulative parse penalties
   - Terminal reward computation uses `reward_policy.success_reward` / `failure_penalty`
-  - `_judge_fn` signature stays `Callable[[list[Turn], str, str], float]` but its return is scaled by policy
+  - `_judge_fn` signature turns into `Callable[[list[Turn], str, str], bool]` where it's just success or not
 
 ---
 

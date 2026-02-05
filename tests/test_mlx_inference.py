@@ -1,6 +1,4 @@
 import os
-import sys
-from pathlib import Path
 
 # Avoid Ray's uv runtime env hook in restricted environments where psutil
 # can't query process parents.
@@ -11,11 +9,9 @@ import pytest
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils import LocalEntryNotFoundError
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from inference.mlx_inference import MLXActor, MLX_VLM_MODEL_MAP
+from environment.inference.mlx_inference import MLXActor, MLX_VLM_MODEL_MAP
+from environment.parsers.qwen3_response_parser import qwen3_response_parser
+from environment.schemas import Turn
 
 
 def _ensure_model_cached(model_id: str) -> None:
@@ -34,7 +30,6 @@ def test_mlx_actor_generate_final_completion() -> None:
         num_cpus=1,
         num_gpus=0,
         resources={"inference_node": 1},
-        runtime_env={"env_vars": {"PYTHONPATH": str(ROOT)}},
     )
     try:
         model_id = os.environ.get(
@@ -46,22 +41,24 @@ def test_mlx_actor_generate_final_completion() -> None:
             _ensure_model_cached(resolved_model_id)
         actor = MLXActor.options(num_gpus=0).remote(
             model=model_id,
+            parse_model_output=qwen3_response_parser,
             max_kv_size=4096,
             trust_remote_code=True,
         )
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Say hello in one short sentence."},
+        turns = [
+            Turn(t=0, role="system", screenshot=None, reasoning=None, content="You are a helpful assistant.", action=None, reward=None),
+            Turn(t=1, role="user", screenshot=None, reasoning=None, content="Say hello in one short sentence.", action=None, reward=None),
         ]
+        turn_refs = [ray.put(t) for t in turns]
         output = ray.get(
             actor.generate.remote(
-                None,
+                turn_refs,
                 {"temperature": 0.2, "max_tokens": 20},
-                messages,
             )
         )
         print("\n\n MLX ACTOR OUTPUT:", output, "\n\n")
-        assert isinstance(output, str)
-        assert output.strip()
+        assert hasattr(output, "reasoning")
+        assert hasattr(output, "content")
+        assert isinstance(output.content, str)
     finally:
         ray.shutdown()

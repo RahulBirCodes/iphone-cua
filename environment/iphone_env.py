@@ -1,24 +1,22 @@
 from __future__ import annotations
 
 import json
-import socket
 import subprocess
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 import requests
 import ray
+from .inference.schemas import GenerateResult
 from .schemas import (
     EnvRuntimeError,
-    ParsedOutput,
     RewardPolicy,
     RolloutResult,
     TerminationReason,
     Turn,
 )
-from .parser import parse as default_xml_parse
 
 CONTROLLER_PORT = 8000
 VM_IP_TIMEOUT = 60
@@ -31,15 +29,19 @@ class iPhoneEnv:
     def __init__(
         self,
         base_image: str,
-        parse_fn: Optional[Callable[[str], ParsedOutput]] = None,
-        judge_fn: Optional[Callable[[list[Turn], str, str], bool]] = None,
-        reward_policy: Optional[RewardPolicy] = None,
+        inference_actor: Any,
+        sampling: dict[str, Any],
+        parse_fn: Callable[[str], dict | None],
+        judge_fn: Callable[[list[Turn], str, str], bool],
+        reward_policy: RewardPolicy,
     ):
         self._base_image = base_image
         self._session = requests.Session()
-        self._parse_fn = parse_fn or default_xml_parse
-        self._judge_fn = judge_fn or _default_judge
-        self._reward_policy = reward_policy or RewardPolicy()
+        self._inference_actor = inference_actor
+        self._sampling = sampling
+        self._parse_fn = parse_fn
+        self._judge_fn = judge_fn
+        self._reward_policy = reward_policy
         self.create_vm()
 
     def collect_rollout(
@@ -52,123 +54,115 @@ class iPhoneEnv:
         save_path: str | None = None,
     ) -> RolloutResult:
         turns: list[Turn] = []
+        turn_refs: list[ray.ObjectRef] = []
         termination_reason: TerminationReason | None = None
         cumulative_reward: float = 0.0
         last_screenshot = ""
+        pending_user_text = ""
 
         try:
-            turns.append(
-                Turn(
-                    t=len(turns),
-                    role="system",
-                    screenshot=None,
-                    raw_output=system_prompt,
-                    parsed_output=None,
-                    action=None,
-                    reward=None,
-                )
+            system_turn = Turn(
+                t=len(turns),
+                role="system",
+                screenshot=None,
+                reasoning=None,
+                content=system_prompt,
+                action=None,
+                reward=None,
             )
+            turns.append(system_turn)
+            turn_refs.append(ray.put(system_turn))
+
+            user_turn = Turn(
+                t=len(turns),
+                role="user",
+                screenshot=None,
+                reasoning=None,
+                content=task_prompt,
+                action=None,
+                reward=None,
+            )
+            turns.append(user_turn)
+            turn_refs.append(ray.put(user_turn))
+
             _, reset_error = self._send_action("reset", {})
             if reset_error:
                 raise EnvRuntimeError(reset_error)
-            screenshot, observe_error = self._send_action("observe", {})
-            # Observation failures are infrastructure errors, not model feedback
-            if observe_error:
-                raise EnvRuntimeError(observe_error)
-            if screenshot:
-                last_screenshot = screenshot
-            user_text = task_prompt  # First turn: pass task prompt as raw string
-            turns.append(
-                Turn(
+
+            for _ in range(max_turns):
+                screenshot, observe_error = self._send_action("observe", {})
+                if observe_error:
+                    raise EnvRuntimeError(observe_error)
+                if screenshot:
+                    last_screenshot = screenshot
+
+                observation_turn = Turn(
                     t=len(turns),
                     role="user",
                     screenshot=last_screenshot,
-                    raw_output=user_text,
-                    parsed_output=None,
+                    reasoning=None,
+                    content=pending_user_text,
                     action=None,
                     reward=None,
                 )
-            )
-            for _ in range(max_turns):
-                raw_output = self._get_llm_resp(turns)
-                parsed_output = self._parse_fn(raw_output)
-                parsed_action = parsed_output.action
+                turns.append(observation_turn)
+                turn_refs.append(ray.put(observation_turn))
+                pending_user_text = ""
+
+                result = self._get_llm_resp(turn_refs)
+                reasoning = result.reasoning
+                content = result.content
+
+                parsed_action = self._parse_fn(content)
                 termination = _terminal_reason(parsed_action)
 
                 if parsed_action is None:
-                    # Parse failure — apply parse penalty
                     parse_penalty = self._reward_policy.parse_penalty
                     cumulative_reward += parse_penalty
-                    turns.append(
-                        Turn(
-                            t=len(turns),
-                            role="assistant",
-                            screenshot=None,
-                            raw_output=raw_output,
-                            parsed_output=parsed_output,
-                            action=None,
-                            reward=parse_penalty,
-                        )
-                    )
-                    feedback = _build_user_text(
-                        error="parse_error",
-                        error_type="parse_error",
-                    )
-                    turns.append(
-                        Turn(
-                            t=len(turns),
-                            role="user",
-                            screenshot=last_screenshot,
-                            raw_output=feedback,
-                            parsed_output=None,
-                            action=None,
-                            reward=None,
-                        )
-                    )
-                    continue
-
-                turns.append(
-                    Turn(
+                    assistant_turn = Turn(
                         t=len(turns),
                         role="assistant",
                         screenshot=None,
-                        raw_output=raw_output,
-                        parsed_output=parsed_output,
-                        action=parsed_action,
-                        reward=None,
+                        reasoning=reasoning,
+                        content=content,
+                        action=None,
+                        reward=parse_penalty,
                     )
+                    turns.append(assistant_turn)
+                    turn_refs.append(ray.put(assistant_turn))
+
+                    pending_user_text = _build_user_text(
+                        error="parse_error",
+                        error_type="parse_error",
+                    )
+                    continue
+
+                assistant_turn = Turn(
+                    t=len(turns),
+                    role="assistant",
+                    screenshot=None,
+                    reasoning=reasoning,
+                    content=content,
+                    action=parsed_action,
+                    reward=None,
                 )
+                turns.append(assistant_turn)
+                turn_refs.append(ray.put(assistant_turn))
+
                 if termination is not None:
                     termination_reason = termination
                     break
 
-                screenshot, env_error = self._step(parsed_action)
-                if screenshot:
-                    last_screenshot = screenshot
-                else:
-                    screenshot = last_screenshot
-                user_text = _build_user_text(
+                _, env_error = self._step(parsed_action)
+                pending_user_text = _build_user_text(
                     error=env_error,
                     error_type="env_error",
-                )
-                turns.append(
-                    Turn(
-                        t=len(turns),
-                        role="user",
-                        screenshot=screenshot,
-                        raw_output=user_text,
-                        parsed_output=None,
-                        action=None,
-                        reward=None,
-                    )
                 )
             else:
                 termination_reason = TerminationReason.TRUNCATED
 
-            # Compute final reward based on termination reason
             final_reward: float
             if termination_reason == TerminationReason.DONE:
-                # Call judge to determine success
                 success = self._judge_fn(turns, task_id, task_prompt)
                 if success:
                     final_reward = self._reward_policy.success_reward
@@ -229,7 +223,7 @@ class iPhoneEnv:
         subprocess.run(["tart", "clone", self._base_image, vm_name], check=True)
         subprocess.Popen(["tart", "run", vm_name, "--no-graphics"])
         vm_ip = self._wait_for_ip(vm_name, timeout=VM_IP_TIMEOUT)
-        self._wait_for_port(vm_ip, CONTROLLER_PORT, timeout=VM_PORT_TIMEOUT)
+        self._wait_for_heartbeat(vm_ip, CONTROLLER_PORT, timeout=VM_PORT_TIMEOUT)
 
         self._vm_id = vm_name
         self._vm_ip = vm_ip
@@ -246,19 +240,27 @@ class iPhoneEnv:
             time.sleep(0.5)
         raise RuntimeError(f"VM {vm_name} did not get IP within {timeout}s")
 
-    def _wait_for_port(self, ip: str, port: int, timeout: float) -> None:
+    def _wait_for_heartbeat(self, ip: str, port: int, timeout: float) -> None:
         deadline = time.monotonic() + timeout
+        heartbeat_url = f"http://{ip}:{port}/heartbeat"
         while time.monotonic() < deadline:
             try:
-                with socket.create_connection((ip, port), timeout=1):
+                resp = self._session.get(heartbeat_url, timeout=1)
+                if resp.status_code != 200:
+                    time.sleep(0.5)
+                    continue
+                payload = resp.json()
+                if payload.get("status") == "ok":
                     return
-            except (socket.timeout, ConnectionRefusedError, OSError):
+            except (requests.exceptions.RequestException, ValueError):
+                # Server not up yet or invalid heartbeat payload.
                 time.sleep(0.5)
-        raise RuntimeError(f"Controller at {ip}:{port} not ready within {timeout}s")
+        raise RuntimeError(
+            f"Controller heartbeat at {heartbeat_url} not ready within {timeout}s"
+        )
 
-    def _get_llm_resp(self, turns: list[Turn]) -> str:
-        _ = turns
-        return ""
+    def _get_llm_resp(self, turn_refs: list[ray.ObjectRef]) -> GenerateResult:
+        return ray.get(self._inference_actor.generate.remote(turn_refs, self._sampling))
 
     def _save_rollout_json(self, result: RolloutResult, save_path: str | None) -> None:
         if save_path:
@@ -278,23 +280,6 @@ def _normalize_screenshot_b64(b64_str: str) -> str:
     return b64_str
 
 
-def _default_judge(turns: list[Turn], task_id: str, task_prompt: str) -> bool:
-    """Default judge function that determines task success.
-
-    Args:
-        turns: List of turns in the rollout
-        task_id: Task identifier
-        task_prompt: Task description
-
-    Returns:
-        True if task succeeded, False otherwise
-    """
-    _ = turns
-    _ = task_id
-    _ = task_prompt
-    return False
-
-
 def _terminal_reason(action: dict | None) -> TerminationReason | None:
     if not action:
         return None
@@ -309,21 +294,9 @@ def _terminal_reason(action: dict | None) -> TerminationReason | None:
 def _build_user_text(
     error: str | None = None,
     error_type: str | None = None,
-) -> str | None:
-    """Build user text for environment responses (not first turn).
-
-    Format: "ENVIRONMENT RESPONSE:\n" + JSON with feedback
-    Returns None if there's no error (successful step).
-
-    Args:
-        error: Error message if any
-        error_type: Type of error ("parse_error" or "env_error")
-
-    Returns:
-        Formatted string or None for successful steps
-    """
+) -> str:
     if not error:
-        return None
+        return ""
     feedback = {"type": error_type or "env_error", "message": error}
     payload = {"feedback": feedback}
     return "ENVIRONMENT RESPONSE:\n" + json.dumps(payload, ensure_ascii=True)

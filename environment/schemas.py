@@ -3,13 +3,6 @@ from enum import Enum
 
 
 @dataclass
-class ParsedOutput:
-    reasoning: str
-    content: str
-    action: dict | None
-
-
-@dataclass
 class RewardPolicy:
     parse_penalty: float = 0.0
     success_reward: float = 1.0
@@ -21,8 +14,8 @@ class Turn:
     t: int
     role: str
     screenshot: str | None
-    raw_output: str | None
-    parsed_output: "ParsedOutput | None"
+    reasoning: str | None
+    content: str
     action: dict | None
     reward: float | None
 

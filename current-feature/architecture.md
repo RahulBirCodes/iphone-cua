@@ -1,277 +1,148 @@
-# Architecture: Action Parsing, Observation Handling & Reward Policy
+# Architecture: Inference Actor ↔ iPhoneEnv Integration
 
 ## Overview
 
-Redesign the rollout loop to use XML-based action parsing (aligned with Qwen3-VL reasoning traces), clean observation/error handling semantics, and a configurable reward policy. The changes span four capability groups: error semantics, user text formatting, XML action parsing, and reward computation.
+Wire the inference actors (`MLXActor`/`VLLMActor`) into `iPhoneEnv._get_llm_resp` using Ray object store refs to avoid re-serializing the growing turns history on every `.remote()` call. Update the inference actor `generate()` API to return a parsed dict via HuggingFace `tokenizer.parse_response()`.
 
 ## Capabilities
 
-### 1. Observation Error Handling
+### 1. Inference Actor API Update
 
-**Problem:** Observation failures (screenshot capture, VM communication) are currently surfaced as model feedback. They should be treated as infrastructure errors since they are not related to model behavior.
+**Problem:** `generate()` returns raw `str`. Caller has to deal with raw model output including special tokens. Should return a structured dict using `tokenizer.parse_response()`.
 
 **1. Data Structures**
 
-No new structures. Use existing `EnvRuntimeError` from `environment/schemas.py`.
+`InferenceActor.generate()` return type changes from `str` → `dict[str, Any]`
+
+The dict comes from `tokenizer.parse_response(raw_text)` — typically contains keys like `role`, `content`, `reasoning_content` (model-dependent).
 
 **2. Implementation Algorithm**
 
 ```
-1. In collect_rollout, after calling _send_action("observe", {}):
-   - If observe returns an error, raise EnvRuntimeError immediately
-   - Do NOT pass observation failures into _build_user_text as feedback
-2. Same for _step: if _send_action returns an error for a non-terminal action:
-   - env_error is still passed as feedback to the model (this is correct — the action was attempted)
-   - But if _send_action raises a connection/HTTP exception, let it propagate as EnvRuntimeError
+For both MLXActor and VLLMActor:
+
+1. Resolve turn_refs via ray.get(turn_refs) → list[Turn]
+2. Convert turns to messages via _turns_to_messages(turns)
+3. Apply chat template with add_generation_prompt=True → prompt string
+4. Generate raw text from model engine (same as today)
+5. Call self._tokenizer.parse_response(raw_text) → dict
+6. Return the dict
+
+generate() signature changes:
+  async def generate(self, turn_refs: list[ray.ObjectRef], sampling: dict[str, Any]) -> dict[str, Any]
 ```
 
 **3. Files**
 
 Modified files:
-
-- `environment/iphone_env.py` — Change `observe` error handling to raise `EnvRuntimeError` instead of passing error as feedback
+- `environment/inference/inference_actor.py` — Update base `generate()` signature: accept `turn_refs: list[ray.ObjectRef]`, return `dict[str, Any]`. Add `_turns_to_messages()` method.
+- `environment/inference/mlx_inference.py` — Update `generate()` to resolve turn refs, format messages, generate, call `parse_response()`, return dict
+- `environment/inference/vllm_inference.py` — Same changes as MLX
 
 ---
 
-### 2. User Text Formatting
+### 2. Turn → Message Conversion (in Inference Actor)
 
-**Problem:** The first task prompt is wrapped in JSON via `_build_user_text`. It should be raw text. Subsequent environment responses should be prefixed with `ENVIRONMENT RESPONSE:` and use JSON. The explicit `request_retry` field should be removed.
+**Problem:** Inference actor receives `list[ray.ObjectRef]` pointing to `Turn` objects. Needs to resolve them and convert to chat messages for the model.
 
 **1. Data Structures**
 
-No new structures.
+Uses existing `Turn` dataclass from `environment/schemas.py`. No new structures.
 
 **2. Implementation Algorithm**
 
 ```
-1. First user turn (task prompt):
-   - Pass task_prompt as raw string directly (no JSON wrapping)
-   - Do not call _build_user_text for the initial task prompt
+_turns_to_messages(turns: list[Turn]) -> list[dict]:
 
-2. Rewrite _build_user_text for subsequent turns:
-   - Remove task_prompt parameter (it's only used on the first turn)
-   - Remove request_retry parameter and "request" field from feedback
-   - Output format:
-     "ENVIRONMENT RESPONSE:\n" + json.dumps({"feedback": {"type": ..., "message": ...}})
-   - When no error:
-     "ENVIRONMENT RESPONSE:\n" + json.dumps({})
-     (or just return None if there's nothing to report — i.e., successful step with screenshot)
+For each turn:
+  - role="system":
+      {"role": "system", "content": turn.raw_output}
 
-3. Parse error feedback:
-   - Same format: "ENVIRONMENT RESPONSE:\n" + json.dumps({"feedback": {"type": "parse_error", "message": "..."}})
-   - Model infers it needs to retry from the error message itself
+  - role="user" WITH screenshot:
+      {"role": "user", "content": [
+          {"type": "text", "text": turn.raw_output or ""},
+          {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{turn.screenshot}"}}
+      ]}
+
+  - role="user" WITHOUT screenshot:
+      {"role": "user", "content": turn.raw_output}
+
+  - role="assistant":
+      {"role": "assistant", "content": turn.raw_output}
+      ** FULL raw_output — reasoning traces ARE kept in context **
 ```
+
+This lives on the base `InferenceActor` class so both MLX and vLLM inherit it.
 
 **3. Files**
 
 Modified files:
-
-- `environment/iphone_env.py` — Rewrite `_build_user_text`, update first user turn in `collect_rollout`
+- `environment/inference/inference_actor.py` — Add `_turns_to_messages()` method
 
 ---
 
-### 3. XML Action Parsing
+### 3. iPhoneEnv ↔ Inference Actor Wiring + Object Store
 
-**Problem:** Need a standalone parser that extracts self-closing XML action tags from model output, separates reasoning from action, and returns structured results. Must work with Qwen3-VL's chat template where `add_generation_prompt=True` opens `<think>` in the prompt, and the model closes it in its output.
-
-**Key invariant:** `add_generation_prompt` opens `<think>` in the PROMPT. The model closes it in the OUTPUT. Everything after `</think>` is the action.
-
-**Generation context:** When `apply_chat_template(..., add_generation_prompt=True)` is called, the template appends:
-
-```
-<|im_start|>assistant
-<think>
-```
-
-So the model begins generating _inside_ the think block. It does NOT output an opening `<think>` tag itself. A typical raw model completion looks like:
-
-```
-(reasoning text here...)
-</think>
-
-<tap x="0.42" y="0.77" />
-<|im_end|>
-```
+**Problem:** `_get_llm_resp` is a stub returning `""`. Need to wire it to the inference actor. Passing the full `list[Turn]` via `.remote()` re-serializes everything each call (quadratic with screenshots). Use `ray.put()` per turn and pass lightweight ObjectRef list instead.
 
 **1. Data Structures**
 
-In `environment/schemas.py`:
+New instance state on `iPhoneEnv`:
+- `self._inference_actor` — Ray actor handle (passed in `__init__`)
+- `self._sampling` — Sampling params dict (passed in `__init__`)
 
-```python
-@dataclass
-class ParsedOutput:
-    reasoning: str | None      # Text before </think> (model's CoT reasoning)
-    action_text: str | None    # Raw XML action tag string (e.g., '<tap x="0.42" y="0.77" />')
-    action: dict | None        # Parsed {"action": str, "params": dict} or None on failure
-    error: str | None          # Parse error message if action extraction failed
-```
-
-Update `Turn`:
-
-```python
-@dataclass
-class Turn:
-    t: int
-    role: str
-    screenshot: str | None
-    raw_output: str | None         # Store raw model completion verbatim
-    parsed_output: ParsedOutput | None  # NEW: breakdown of LLM response
-    action: dict | None            # Keep for backward compat; same as parsed_output.action
-    reward: float | None
-```
-
-**2. Implementation Algorithm**
-
-Allowed actions and their parameter schemas:
-
-```
-tap(x: float, y: float)
-long_press(x: float, y: float)
-swipe(start_x: float, start_y: float, end_x: float, end_y: float)
-type_text(text: str)
-go_home()
-wait()
-fail()
-finished()
-```
-
-XML format: `<action_name attr1="val1" attr2="val2" />`
-
-Parsing algorithm (input is the raw model completion string):
-
-```
-parse(raw_output: str) -> ParsedOutput:
-
-1. Strip special tokens + whitespace
-   - Remove trailing/embedded <|im_end|> (and any similar end markers)
-   - text = text.strip()
-
-2. Split reasoning vs action region
-   - Look for the literal substring "</think>"
-   - If "</think>" exists:
-     - reasoning_text = everything BEFORE "</think>" (trimmed)
-     - action_region  = everything AFTER "</think>" (trimmed)
-   - If "</think>" does NOT exist:
-     - reasoning_text = "" (empty string)
-     - action_region  = entire output (trimmed)
-   - NOTE: The model does NOT output an opening <think> — that's in the prompt.
-     If a leading <think> somehow appears in the output, strip it from reasoning_text.
-
-3. Extract exactly one action tag from action_region
-   - Use regex to find self-closing XML tags: <(tag_name) ... />
-   - Only match tags in ALLOWED_ACTIONS = {tap, long_press, swipe, type_text, go_home, wait, fail, finished}
-   - If 0 matching tags found: return ParsedOutput(reasoning_text, None, None, error="no_action_tag_found")
-   - If >1 matching tags found: return ParsedOutput(reasoning_text, None, None, error="multiple_action_tags")
-   - If exactly 1: proceed to attribute parsing
-
-4. Parse attributes from the matched tag
-   - Use regex or xml.etree to extract attributes
-   - Validate against action schema:
-     - tap: x (float 0-1), y (float 0-1)
-     - long_press: x (float 0-1), y (float 0-1)
-     - swipe: start_x (float 0-1), start_y (float 0-1), end_x (float 0-1), end_y (float 0-1)
-     - type_text: text (str, required)
-     - go_home, wait, fail, finished: no params
-   - If validation fails: return ParsedOutput(reasoning_text, tag_text, None, error="invalid_params: ...")
-
-5. Return ParsedOutput(
-     reasoning=reasoning_text,
-     action_text=matched_tag_string,
-     action={"action": tag_name, "params": {validated params}},
-     error=None
-   )
-```
-
-**What gets stored vs reused:**
-
-- `Turn.raw_output` = exact model completion verbatim (for logging/debugging)
-- `Turn.parsed_output` = structured breakdown (reasoning, action, error)
-- Reasoning text does NOT get fed back into the next prompt (avoids context bloat)
-- Next prompt includes: system instructions, current observation (screenshot + JSON), optional short action history
-- Full reasoning traces stay in logs, not in the prompt
-
-**3. Files**
-
-New files:
-
-- `environment/action_parser.py` — Standalone XML action parser with `parse(raw_output: str) -> ParsedOutput`
-  - Contains: `ALLOWED_ACTIONS` dict mapping action name -> param schema
-  - Contains: `parse()` function implementing the algorithm above
-  - Contains: param validation helpers (float range check, required field check)
-
-Modified files:
-
-- `environment/schemas.py` — Add `ParsedOutput` dataclass
-- `environment/iphone_env.py` — Replace `_default_parse` and `_extract_action` with the new parser:
-  - `_parse_fn` signature becomes `Callable[[str], ParsedOutput]`
-  - `_extract_action` is removed (action is on `ParsedOutput.action`)
-  - `ParseResult` type alias is removed
-  - Rollout loop uses `parsed_output.action` for stepping
-  - Rollout loop stores `parsed_output` on `Turn`
-  - Parse error path uses `parsed_output.error` message in feedback
-
----
-
-### 4. Reward Policy
-
-**Problem:** Need a configurable reward structure. Parse failures should optionally incur a penalty. Final reward comes from judge function, gated by success/failure.
-
-**1. Data Structures**
-
-In `environment/schemas.py`:
-
-```python
-@dataclass
-class RewardPolicy:
-    parse_penalty: float = 0.0      # Penalty applied each time parser fails
-    success_reward: float = 1.0     # Reward when judge determines success
-    failure_penalty: float = 0.0    # Penalty when judge determines failure
-```
+New local state in `collect_rollout`:
+- `turn_refs: list[ray.ObjectRef]` — Grows alongside `turns`, one ref per turn
 
 **2. Implementation Algorithm**
 
 ```
-Reward accumulation during rollout:
+__init__ changes:
+  - Add parameter: inference_actor (ray actor handle)
+  - Add parameter: sampling (dict — temperature, max_tokens, etc.)
+  - Store as self._inference_actor, self._sampling
 
-1. Initialize cumulative_reward = 0.0
+collect_rollout changes:
+  - Initialize turn_refs: list[ray.ObjectRef] = []
+  - Every place a Turn is appended to turns:
+      ref = ray.put(turn)
+      turn_refs.append(ref)
+  - Call _get_llm_resp(turn_refs) instead of _get_llm_resp(turns)
 
-2. On each turn where parsed_output.error is not None (parse failure):
-   - cumulative_reward += reward_policy.parse_penalty
-   - Store parse_penalty on that assistant Turn.reward
-
-3. On termination:
-   - If DONE: call judge_fn → if judge says success, final_reward = reward_policy.success_reward
-                              → if judge says failure, final_reward = reward_policy.failure_penalty
-   - If FAIL (model called fail()): final_reward = reward_policy.failure_penalty
-   - If TRUNCATED: final_reward = reward_policy.failure_penalty
-   - total_reward = cumulative_reward + final_reward
-
-4. Store total_reward on RolloutResult.final_reward
+_get_llm_resp(turn_refs: list[ray.ObjectRef]) -> str:
+  1. result_dict = ray.get(
+         self._inference_actor.generate.remote(turn_refs, self._sampling)
+     )
+  2. Return result_dict["content"]
+     (raw output string — fed into parse_fn as before)
 ```
+
+**Object store efficiency:**
+- Each Turn is `ray.put()` once → immutable, never re-serialized
+- `turn_refs` list is just small ObjectRef pointers (~bytes each)
+- Inference actor calls `ray.get(turn_refs)` to resolve → zero-copy on same node
+- Old Turn objects persist in store for rollout duration, GC'd when refs dropped
 
 **3. Files**
 
 Modified files:
-
-- `environment/schemas.py` — Add `RewardPolicy` dataclass
 - `environment/iphone_env.py`:
-  - `iPhoneEnv.__init__` accepts `reward_policy: RewardPolicy` (default `RewardPolicy()`)
-  - `collect_rollout` tracks cumulative parse penalties
-  - Terminal reward computation uses `reward_policy.success_reward` / `failure_penalty`
-  - `_judge_fn` signature turns into `Callable[[list[Turn], str, str], bool]` where it's just success or not
+  - `__init__`: add `inference_actor` and `sampling` params
+  - `collect_rollout`: maintain `turn_refs` alongside `turns`, `ray.put()` each new turn
+  - `_get_llm_resp`: signature changes to accept `turn_refs`, calls inference actor, extracts string from returned dict
 
 ---
 
 ## Key Architectural Decisions
 
-1. **Parser is a standalone module** (`environment/action_parser.py`), not embedded in iphone_env.py. This allows unit testing the parser independently and swapping parser implementations.
+1. **Turn refs, not message refs.** We store `Turn` objects in the object store (not pre-formatted messages). The inference actor handles Turn→message conversion because it knows the model's expected format (multimodal content blocks, chat template).
 
-2. **ParsedOutput is the single return type from parsing.** It replaces the old `ParseResult = dict | tuple[dict, float]` union. All information (reasoning, action, error) lives on one object. The reward-from-parse concept is removed — rewards come exclusively from `RewardPolicy`.
+2. **Inference actor resolves refs itself.** `generate()` receives `list[ObjectRef]` and calls `ray.get()` internally. Only small ref pointers cross the `.remote()` boundary.
 
-3. **No explicit retry request in feedback.** The model receives the error message and must infer the need to retry. This simplifies the protocol and avoids prompt engineering in the environment layer.
+3. **`_get_llm_resp` still returns `str`.** Even though the inference actor returns a parsed dict, `_get_llm_resp` extracts the content string from it. The existing rollout loop stays unchanged — it feeds a string to `parse_fn` (XML action parser). The dict is internal to the inference layer.
 
-4. **RewardPolicy defaults are neutral** (parse_penalty=0.0, failure_penalty=0.0, success_reward=1.0). This means the system behaves like before until explicitly configured for RL training.
+4. **Full reasoning in assistant turns.** Assistant `raw_output` (including CoT reasoning) is preserved in the Turn and included verbatim in messages sent to the model. The model sees its own prior reasoning traces.
 
-5. **Observation failures are fatal.** If the environment cannot take a screenshot, that's infrastructure, not model behavior. Raising `EnvRuntimeError` lets the orchestrator handle retries at the VM level rather than polluting the model's context.
+5. **Sampling params on iPhoneEnv.** Passed once at init, used for every `generate` call in the rollout. Keeps the rollout loop clean.
 
-6. **Turn.action is kept alongside Turn.parsed_output** for backward compatibility with existing code that reads `turn.action`. Both fields contain the same action dict (or None).
+6. **`add_generation_prompt=True`** is already set in both `MLXActor.format_messages()` and `VLLMActor.format_messages()`. This stays as-is.

@@ -11,3 +11,8 @@ wheels/
 
 # Config file
 *.ssh_config.py
+
+*skills
+*.codex
+*.claude
+*.idea

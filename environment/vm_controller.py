@@ -5,7 +5,7 @@ import json
 import subprocess
 import tempfile
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -53,7 +53,7 @@ class VMController:
 
     def run(self) -> None:
         """Start the HTTP server and block forever."""
-        server = ThreadingHTTPServer((self.host, self.port), _VMControllerHandler)
+        server = HTTPServer((self.host, self.port), _VMControllerHandler)
         server.controller = self
         server.serve_forever()
 

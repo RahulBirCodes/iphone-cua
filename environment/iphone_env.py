@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 import requests
 import ray
-from .inference.schemas import GenerateResult
+from .policy import PolicyBackend
 from .schemas import (
     EnvRuntimeError,
     RewardPolicy,
@@ -23,13 +23,13 @@ VM_IP_TIMEOUT = 60
 VM_PORT_TIMEOUT = 60
 
 
-@ray.remote(resources={"iphone_slot": 1})
+@ray.remote(resources={"iphone_slot": 1}, max_restarts=3)
 class iPhoneEnv:
     # vm_ip is ip available on virtual address in host
     def __init__(
         self,
         base_image: str,
-        inference_actor: Any,
+        policy_backend: PolicyBackend,
         sampling: dict[str, Any],
         parse_fn: Callable[[str], dict | None],
         judge_fn: Callable[[list[Turn], str, str], bool],
@@ -37,7 +37,7 @@ class iPhoneEnv:
     ):
         self._base_image = base_image
         self._session = requests.Session()
-        self._inference_actor = inference_actor
+        self._policy_backend = policy_backend
         self._sampling = sampling
         self._parse_fn = parse_fn
         self._judge_fn = judge_fn
@@ -54,7 +54,6 @@ class iPhoneEnv:
         save_path: str | None = None,
     ) -> RolloutResult:
         turns: list[Turn] = []
-        turn_refs: list[ray.ObjectRef] = []
         termination_reason: TerminationReason | None = None
         cumulative_reward: float = 0.0
         last_screenshot = ""
@@ -71,7 +70,6 @@ class iPhoneEnv:
                 reward=None,
             )
             turns.append(system_turn)
-            turn_refs.append(ray.put(system_turn))
 
             user_turn = Turn(
                 t=len(turns),
@@ -83,7 +81,6 @@ class iPhoneEnv:
                 reward=None,
             )
             turns.append(user_turn)
-            turn_refs.append(ray.put(user_turn))
 
             _, reset_error = self._send_action("reset", {})
             if reset_error:
@@ -106,12 +103,11 @@ class iPhoneEnv:
                     reward=None,
                 )
                 turns.append(observation_turn)
-                turn_refs.append(ray.put(observation_turn))
                 pending_user_text = ""
 
-                result = self._get_llm_resp(turn_refs)
-                reasoning = result.reasoning
-                content = result.content
+                output = self._policy_backend.generate(turns, self._sampling)
+                reasoning = output.reasoning
+                content = output.content
 
                 parsed_action = self._parse_fn(content)
                 termination = _terminal_reason(parsed_action)
@@ -129,7 +125,6 @@ class iPhoneEnv:
                         reward=parse_penalty,
                     )
                     turns.append(assistant_turn)
-                    turn_refs.append(ray.put(assistant_turn))
 
                     pending_user_text = _build_user_text(
                         error="parse_error",
@@ -147,7 +142,6 @@ class iPhoneEnv:
                     reward=None,
                 )
                 turns.append(assistant_turn)
-                turn_refs.append(ray.put(assistant_turn))
 
                 if termination is not None:
                     termination_reason = termination
@@ -258,9 +252,6 @@ class iPhoneEnv:
         raise RuntimeError(
             f"Controller heartbeat at {heartbeat_url} not ready within {timeout}s"
         )
-
-    def _get_llm_resp(self, turn_refs: list[ray.ObjectRef]) -> GenerateResult:
-        return ray.get(self._inference_actor.generate.remote(turn_refs, self._sampling))
 
     def _save_rollout_json(self, result: RolloutResult, save_path: str | None) -> None:
         if save_path:

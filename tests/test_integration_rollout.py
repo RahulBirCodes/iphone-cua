@@ -21,8 +21,24 @@ from huggingface_hub.utils import LocalEntryNotFoundError
 from environment.inference.mlx_inference import MLXActor, MLX_VLM_MODEL_MAP
 from environment.iphone_env import iPhoneEnv
 from environment.parsers import parse as action_parse
+from environment.policy import PolicyOutput
 from environment.parsers.qwen3_response_parser import qwen3_response_parser
 from environment.schemas import RewardPolicy, RolloutResult, TerminationReason
+
+
+class _LegacyInferencePolicyBackend:
+    def __init__(self, actor):
+        self._actor = actor
+
+    def generate(self, turns, sampling) -> PolicyOutput:
+        turn_refs = [ray.put(turn) for turn in turns]
+        result = ray.get(self._actor.generate.remote(turn_refs, sampling))
+        return PolicyOutput(
+            content=result.content,
+            reasoning=result.reasoning,
+            backend_name="legacy-test-adapter",
+            raw_response=result,
+        )
 
 
 def _always_false_judge(turns: list, task_id: str, task_prompt: str) -> bool:
@@ -72,7 +88,7 @@ def test_single_rollout() -> None:
         # Spawn iPhoneEnv wired to the inference actor
         env = iPhoneEnv.remote(
             base_image=base_image,
-            inference_actor=inference_actor,
+            policy_backend=_LegacyInferencePolicyBackend(inference_actor),
             sampling=sampling,
             parse_fn=action_parse,
             judge_fn=_always_false_judge,

@@ -1,4 +1,4 @@
-# Distributed iPhone RL Environment — Architecture (Concise)
+# Distributed iPhone RL Environment
 
 ```
 Ray Driver / Trainer
@@ -45,16 +45,3 @@ Ray Driver / Trainer
 ## Key points
 
 - One rollout == one `iPhoneEnv` Ray actor == one VM. No sharing until rollout completes.
-- Ray custom resources cap per-host concurrency (e.g., `iphone_slot: K`).
-- Inference runs on GPU-tagged Ray nodes; each `VLLMActor` reserves `num_gpus=2`.
-- `VLLMActor.generate` returns final completion only (async, continuous batching in vLLM).
-- `iPhoneEnv` talks to VM via HTTP on port 8000 (`/action`), gets base64 screenshots.
-- VMController controls the macOS Simulator (xcrun + AppleScript + pynput).
-
-## Files (entry points)
-
-- `iphone_env.py` — Ray actor + rollout loop + VM lifecycle
-- `inference/vllm_inference.py` — Ray vLLM actor for async inference (TP=2)
-- `vm_controller.py` — HTTP server inside VM that drives Simulator
-- `ray_cluster.template.yaml` — host inventory + resource limits
-- `start_ray_cluster.sh` — starts Ray head/workers with resource caps
